@@ -117,13 +117,14 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, mel_codes, conditioning_
             cond_mels.append(cond_mel)
         cond_mels = torch.stack(cond_mels, dim=1)
 
-        output_shape = (mel_codes.shape[0], 100, mel_codes.shape[-1]*4)
-        precomputed_embeddings = diffusion_model.timestep_independent(mel_codes, cond_mels, False)
+        output_seq_len = mel_codes.shape[-1]*4*24000//22050  # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
+        output_shape = (mel_codes.shape[0], 100, output_seq_len)
+        precomputed_embeddings = diffusion_model.timestep_independent(mel_codes, cond_mels, output_seq_len, False)
 
         noise = torch.randn(output_shape, device=mel_codes.device) * temperature
         mel = diffuser.p_sample_loop(diffusion_model, output_shape, noise=noise,
                                       model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings})
-        return denormalize_tacotron_mel(mel)[:,:,:mel_codes.shape[-1]*4]
+        return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
 
 
 class TextToSpeech:
