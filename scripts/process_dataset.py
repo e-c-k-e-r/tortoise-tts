@@ -5,7 +5,7 @@ import torchaudio
 import numpy as np
 from tqdm.auto import tqdm
 from pathlib import Path
-from vall_e.config import cfg
+from tortoise_tts.config import cfg
 
 # things that could be args
 cfg.sample_rate = 24_000
@@ -16,15 +16,14 @@ cfg.inference.dtype = torch.bfloat16
 cfg.inference.amp = True
 """
 
-from vall_e.emb.g2p import encode as valle_phonemize
-from vall_e.emb.qnt import encode as valle_quantize, _replace_file_extension
+from tortoise_tts.emb.mel import encode as tortoise_mel_encode, _replace_file_extension
 
 input_audio = "voices"
 input_metadata = "metadata"
 output_dataset = f"training-{'2' if cfg.sample_rate == 24_000 else '4'}4KHz-{cfg.inference.audio_backend}"
 device = "cuda"
 
-audio_extension = ".dac" if cfg.inference.audio_backend == "dac" else ".enc"
+audio_extension = ".mel"
 
 slice = "auto"
 missing = {
@@ -57,30 +56,8 @@ for dataset_name in sorted(os.listdir(f'./{input_audio}/')):
 					continue
 
 				waveform, sample_rate = torchaudio.load(inpath)
-				qnt = valle_quantize(waveform, sr=sample_rate, device=device)
-
-				if cfg.inference.audio_backend == "dac":
-					np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), {
-						"codes": qnt.codes.cpu().numpy().astype(np.uint16),
-						"metadata": {
-							"original_length": qnt.original_length,
-							"sample_rate": qnt.sample_rate,
-							
-							"input_db": qnt.input_db.cpu().numpy().astype(np.float32),
-							"chunk_length": qnt.chunk_length,
-							"channels": qnt.channels,
-							"padding": qnt.padding,
-							"dac_version": "1.0.0",
-						},
-					})
-				else:
-					np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), {
-						"codes": qnt.cpu().numpy().astype(np.uint16),
-						"metadata": {
-							"original_length": waveform.shape[-1],
-							"sample_rate": sample_rate,
-						},
-					})
+				mel = tortoise_mel_encode(waveform, sr=sample_rate, device=device)
+				np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), mel )
 
 			continue
 		
@@ -177,45 +154,16 @@ for dataset_name in sorted(os.listdir(f'./{input_audio}/')):
 					))
 
 		if len(wavs) > 0:
-			for job in tqdm(wavs, desc=f"Quantizing: {speaker_id}"):
+			for job in tqdm(wavs, desc=f"Encoding: {speaker_id}"):
 				try:
 					outpath, text, language, waveform, sample_rate = job
 
 					phones = valle_phonemize(text)
-					qnt = valle_quantize(waveform, sr=sample_rate, device=device)
-
-					if cfg.inference.audio_backend == "dac":
-						np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), {
-							"codes": qnt.codes.cpu().numpy().astype(np.uint16),
-							"metadata": {
-								"original_length": qnt.original_length,
-								"sample_rate": qnt.sample_rate,
-								
-								"input_db": qnt.input_db.cpu().numpy().astype(np.float32),
-								"chunk_length": qnt.chunk_length,
-								"channels": qnt.channels,
-								"padding": qnt.padding,
-								"dac_version": "1.0.0",
-
-								"text": text.strip(),
-								"phonemes": "".join(phones),
-								"language": language,
-							},
-						})
-					else:
-						np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), {
-							"codes": qnt.cpu().numpy().astype(np.uint16),
-							"metadata": {
-								"original_length": waveform.shape[-1],
-								"sample_rate": sample_rate,
-
-								"text": text.strip(),
-								"phonemes": "".join(phones),
-								"language": language,
-							},
-						})
+					mel = tortoise_mel_encode(waveform, sr=sample_rate, device=device)
+					mel["text"] = text
+					np.save(open(_replace_file_extension(outpath, audio_extension), "wb"), mel)
 				except Exception as e:
-					print(f"Failed to quantize: {outpath}:", e)
+					print(f"Failed to encode: {outpath}:", e)
 					continue
 
 open("./missing.json", 'w', encoding='utf-8').write(json.dumps(missing))

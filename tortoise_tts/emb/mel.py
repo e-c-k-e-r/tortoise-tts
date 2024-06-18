@@ -15,6 +15,19 @@ from tqdm import tqdm
 
 from ..models import load_model, unload_model
 
+import torch.nn.functional as F
+
+def pad_or_truncate(t, length):
+	"""
+	Utility function for forcing <t> to have the specified sequence length, whether by clipping it or padding it with 0s.
+	"""
+	if t.shape[-1] == length:
+		return t
+	elif t.shape[-1] < length:
+		return F.pad(t, (0, length-t.shape[-1]))
+	else:
+		return t[..., :length]
+
 # decodes mel spectrogram into a wav
 @torch.inference_mode()
 def decode(codes: Tensor, device="cuda"):
@@ -34,30 +47,30 @@ def decode_to_file(resps: Tensor, path: Path, device="cuda"):
 def _replace_file_extension(path, suffix):
 	return (path.parent / path.name.split(".")[0]).with_suffix(suffix)
 
-def format_autoregressive_conditioning( wav, cond_length=132300, device ):
+def format_autoregressive_conditioning( wav, cond_length=132300, device="cuda" ):
 	"""
 	Converts the given conditioning signal to a MEL spectrogram and clips it as expected by the models.
 	"""
 	model = load_model("tms", device=device)
 
-	gap = wav.shape[-1] - cond_length
-
-	if gap < 0:
-		wav = F.pad(wav, pad=(0, abs(gap)))
-	elif gap > 0:
-		rand_start = random.randint(0, gap)
-		wav = wav[:, rand_start:rand_start + cond_length]
+	if cond_length > 0:
+		gap = wav.shape[-1] - cond_length
+		if gap < 0:
+			wav = F.pad(wav, pad=(0, abs(gap)))
+		elif gap > 0:
+			rand_start = random.randint(0, gap)
+			wav = wav[:, rand_start:rand_start + cond_length]
 
 	mel_clip = model(wav.unsqueeze(0)).squeeze(0) # ???
 	return mel_clip.unsqueeze(0).to(device) # ???
 
 def format_diffusion_conditioning( sample, device, do_normalization=False ):
-	model = load_model("stft", device=device)
+	model = load_model("stft", device=device, sr=24_000)
 
 	sample = torchaudio.functional.resample(sample, 22050, 24000)
 	sample = pad_or_truncate(sample, 102400)
 	sample = sample.to(device)
-	mel = model.mel_spectrogram(wav)
+	mel = model.mel_spectrogram(sample)
 	"""
 	if do_normalization:
 		mel = normalize_tacotron_mel(mel)
@@ -70,6 +83,7 @@ def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda"):
 	dvae = load_model("dvae", device=device)
 	unified_voice = load_model("unified_voice", device=device)
 	diffusion = load_model("diffusion", device=device)
+	mel_inputs = format_autoregressive_conditioning( wav, 0, device )
 
 	wav_length = wav.shape[-1]
 	duration = wav_length / sr
@@ -78,16 +92,19 @@ def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda"):
 	diffusion_conds = torch.stack([ format_diffusion_conditioning(wav.to(device), device=device) ], dim=1)
 
 	codes = dvae.get_codebook_indices( mel_inputs )
-	auto_latent = unified_voice.get_conditioning(autoregressive_conds)
+
+	autoregressive_latent = unified_voice.get_conditioning(autoregressive_conds)
 	diffusion_latent = diffusion.get_conditioning(diffusion_conds)
 
 	return {
 		"codes": codes,
 		"conds": (autoregressive_conds, diffusion_conds),
 		"latent": (autoregressive_latent, diffusion_latent),
-		"original_length": wav_length,
-		"sample_rate": sr,
-		"duration": duration
+		"metadata": {
+			"original_length": wav_length,
+			"sample_rate": sr,
+			"duration": duration
+		}
 	}
 
 def encode_from_files(paths, device="cuda"):

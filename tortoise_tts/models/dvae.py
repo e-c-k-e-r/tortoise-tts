@@ -119,7 +119,7 @@ class DiscreteVAE(nn.Module):
 		positional_dims = 1, # 2
 		num_tokens = 8192, # 512
 		codebook_dim = 512,
-		num_layers = 3,
+		num_layers = 2, # 3
 		num_resnet_blocks = 3, # 0
 		hidden_dim = 512, # 64
 		channels = 80, # 3

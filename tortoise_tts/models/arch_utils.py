@@ -289,7 +289,7 @@ class AudioMiniEncoder(nn.Module):
 		return h[:, :, 0]
 
 
-DEFAULT_MEL_NORM_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../data/mel_norms.pth')
+DEFAULT_MEL_NORM_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../data/mel_norms.pth')
 
 
 class TorchMelSpectrogram(nn.Module):
@@ -463,6 +463,34 @@ def window_sumsquare(window, n_frames, hop_length=200, win_length=800,
 		x[sample:min(n, sample + n_fft)] += win_sq[:max(0, min(n_fft, n - sample))]
 	return x
 
+TACOTRON_MEL_MAX = 2.3143386840820312
+TACOTRON_MEL_MIN = -11.512925148010254
+
+
+def denormalize_tacotron_mel(norm_mel):
+    return ((norm_mel+1)/2)*(TACOTRON_MEL_MAX-TACOTRON_MEL_MIN)+TACOTRON_MEL_MIN
+
+
+def normalize_tacotron_mel(mel):
+    return 2 * ((mel - TACOTRON_MEL_MIN) / (TACOTRON_MEL_MAX - TACOTRON_MEL_MIN)) - 1
+
+
+def dynamic_range_compression(x, C=1, clip_val=1e-5):
+    """
+    PARAMS
+    ------
+    C: compression factor
+    """
+    return torch.log(torch.clamp(x, min=clip_val) * C)
+
+
+def dynamic_range_decompression(x, C=1):
+    """
+    PARAMS
+    ------
+    C: compression factor used to compress
+    """
+    return torch.exp(x) / C
 
 class STFT(torch.nn.Module):
 	"""adapted from Prem Seetharaman's https://github.com/pseeth/pytorch-stft"""
@@ -566,9 +594,16 @@ class STFT(torch.nn.Module):
 		return reconstruction
 
 class TacotronSTFT(torch.nn.Module):
-	def __init__(self, filter_length=1024, hop_length=256, win_length=1024,
-				 n_mel_channels=80, sampling_rate=22050, mel_fmin=0.0,
-				 mel_fmax=8000.0):
+	def __init__(
+		self,
+		filter_length=1024,
+		hop_length=256,
+		win_length=1024,
+		n_mel_channels=80,
+		sampling_rate=22050,
+		mel_fmin=0.0,
+		mel_fmax=8000.0
+	):
 		super().__init__()
 		self.n_mel_channels = n_mel_channels
 		self.sampling_rate = sampling_rate

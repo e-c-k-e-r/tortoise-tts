@@ -54,6 +54,9 @@ setup(
         "tokenizers",
         "transformers",
 
+        #
+        "rotary_embedding_torch",
+
         # training bloat
         "auraloss[all]", # [all] is needed for MelSTFTLoss
         "h5py",

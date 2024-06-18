@@ -2,10 +2,9 @@
 
 from .config import cfg
 from .data import create_train_val_dataloader
-from .emb import qnt
+from .emb import mel
 
 from .utils import setup_logging, to_device, trainer, flatten_dict, do_gc
-from .data import fold_inputs, unfold_outputs
 from .utils.distributed import is_global_leader
 
 import auraloss
@@ -34,7 +33,7 @@ def train_feeder(engine, batch):
 		text_inputs = pad_sequence([ text for text in batch["text"] ], batch_first = True)
 		text_lengths = pad_sequence([ text.shape[0] for text in batch["text"] ], batch_first = True)
 		mel_codes = pad_sequence([ code for codes in batch["mel"] ], batch_first = True)
-		wav_lengths = pad_sequence([ length for  length in batch["wav_lengths"] ], batch_first = True)
+		wav_lengths = pad_sequence([ length for  length in batch["wav_length"] ], batch_first = True)
 
 
 		engine.forward(conditioning_latents, text_inputs, text_lengths, mel_codes, wav_lengths)

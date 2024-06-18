@@ -3,7 +3,7 @@
 
 from functools import cache
 
-from ..arch_utils import TorchMelSpectrogram, TacotronSTFT
+from .arch_utils import TorchMelSpectrogram, TacotronSTFT
 
 from .unified_voice import UnifiedVoice
 from .diffusion import DiffusionTTS
@@ -11,26 +11,45 @@ from .vocoder import UnivNetGenerator
 from .clvp import CLVP
 from .dvae import DiscreteVAE
 
+import os
+import torch
+
+DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../data/')
+
 # semi-necessary as a way to provide a mechanism for other portions of the program to access models
 @cache
 def load_model(name, device="cuda", **kwargs):
+	load_path = None
 	if "autoregressive" in name or "unified_voice" in name:
 		model = UnifiedVoice(**kwargs)
+		load_path = f'{DEFAULT_MODEL_PATH}/autoregressive.pth'
 	elif "diffusion" in name:
 		model = DiffusionTTS(**kwargs)
+		load_path = f'{DEFAULT_MODEL_PATH}/diffusion.pth'
 	elif "clvp" in name:
 		model = CLVP(**kwargs)
+		load_path = f'{DEFAULT_MODEL_PATH}/clvp2.pth'
 	elif "vocoder" in name:
 		model = UnivNetGenerator(**kwargs)
+		load_path = f'{DEFAULT_MODEL_PATH}/vocoder.pth'
 	elif "dvae" in name:
+		load_path = f'{DEFAULT_MODEL_PATH}/dvae.pth'
 		model = DiscreteVAE(**kwargs)
-	# to-do: figure out of the below two give the exact same output, since the AR uses #1, the Diffusion uses #2
+	# to-do: figure out of the below two give the exact same output
 	elif "stft" in name:
-		model = TacotronSTFT(1024, 256, 1024, 100, 24000, 0, 12000, **kwargs)
+		sr = kwargs.pop("sr")
+		if sr == 24_000:
+			model = TacotronSTFT(1024, 256, 1024, 100, 24000, 0, 12000, **kwargs)
+		else:
+			model = TacotronSTFT(**kwargs)
 	elif "tms" in name:
 		model = TorchMelSpectrogram(**kwargs)
-
+	
 	model = model.to(device=device)
+
+	if load_path is not None:
+		model.load_state_dict(torch.load(load_path, map_location=device), strict=False)
+
 	return model
 
 def unload_model():

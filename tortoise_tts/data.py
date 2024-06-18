@@ -169,8 +169,10 @@ def _get_paths_of_extensions( path, extensions=_get_mel_extension(), validate=Fa
 def _load_mels(path, return_metadata=False) -> Tensor:
 	mel = np.load(_get_mel_path(path), allow_pickle=True)[()]
 	if return_metadata:
-		return torch.from_numpy(mel["codes"].astype(int))[0][:].t().to(torch.int16), mel["metadata"]
-	return torch.from_numpy(mel["codes"].astype(int))[0][:].t().to(torch.int16)
+		mel["metadata"]["text"] = mel["text"]
+
+		return mel["codes"].to(torch.int16), mel["metadata"]
+	return mel["codes"].to(torch.int16)
 
 # prune consecutive spaces
 def _cleanup_phones( phones, targets=[" "]):
@@ -453,37 +455,19 @@ class Dataset(_Dataset):
 			)
 			"""
 
-		prom_length = 0
-		trim_length = int(random.uniform(cfg.dataset.prompt_duration_range[0], cfg.dataset.prompt_duration_range[1]) * cfg.dataset.frames_per_second)
+		path = random.choice(choices)
+		if cfg.dataset.use_hdf5:
+			key = _get_hdf5_path(path)
 
-		for _ in range(cfg.dataset.max_prompts):
-			path = random.choice(choices)
-			if cfg.dataset.use_hdf5:
-				key = _get_hdf5_path(path)
+			if "audio" not in cfg.hdf5[key]:
+				_logger.warning(f'MISSING AUDIO: {key}')
+				return
 
-				if "audio" not in cfg.hdf5[key]:
-					_logger.warning(f'MISSING AUDIO: {key}')
-					continue
-
-				mel = torch.from_numpy(cfg.hdf5[key]["audio"][:]).to(torch.int16)
-			else:
-				mel = _load_mels(path, return_metadata=False)
-
-			if 0 < trim_length and trim_length < mel.shape[0]:
-				mel = trim( mel, trim_length )
-
-			prom_list.append(mel)
-			prom_length += mel.shape[0]
-
-			if prom_length >= trim_length or random.random() > cfg.dataset.random_utterance:
-				break
-
-		# might be better to decode => concat waveforms with silence in between => reencode
-		# as you technically can't just append encodec sequences together like this without issues
-		prom = torch.cat(prom_list)
-
-		if 0 < trim_length and trim_length < prom.shape[0]:
-			prom = trim( prom, trim_length )
+			# audio / cond / latents
+			# parameter names and documentation are weird
+			prom = torch.from_numpy(cfg.hdf5[key]["cond"]).to(torch.int16)
+		else:
+			prom = _load_mels(path, return_metadata=False)
 
 		return prom
 
@@ -507,15 +491,36 @@ class Dataset(_Dataset):
 			spkr_group = self.get_speaker_group(path)
 			#spkr_group_id = self.spkr_group_symmap[spkr_group]
 
+		if cfg.dataset.use_hdf5:
+			key = _get_hdf5_path(path)
+
+			if key not in cfg.hdf5:
+				raise RuntimeError(f'Key of Path ({path}) not in HDF5: {key}')
+
+			text = cfg.hdf5[key]["text"][:]
+			mel = cfg.hdf5[key]["audio"][:]
+			latents = cfg.hdf5[key]["latents"][:]
+			
+			text = torch.from_numpy(text).to(self.text_dtype)
+			mel = torch.from_numpy(mel).to(torch.int16)
+			latents = torch.from_numpy(latents)
+			wav_length = cfg.hdf5[key].attrs["wav_length"]
+		else:
+			mel, metadata = _load_mels(path, return_metadata=True)
+			text = torch.tensor(metadata["text"]).to(self.text_dtype)
+			latents = torch.from_numpy(metadata["latent"][0])
+			wav_length = metadata["wav_length"]
 
 		return dict(
 			index=index,
 			path=Path(path),
 			spkr_name=spkr_name,
 			spkr_id=spkr_id,
-			#text=text,
-			#proms=proms,
-			#resps=resps,
+
+			latents=latents,
+			text=text,
+			mel=mel,
+			wav_length=wav_length,
 		)
 
 	def head_(self, n):
@@ -603,12 +608,14 @@ def create_train_val_dataloader():
 	return train_dl, subtrain_dl, val_dl
 
 def unpack_audio( npz ):
-	mel = torch.from_numpy(npz["codes"].astype(int))[0].t().to(dtype=torch.int16)
+	mel = npz["codes"].to(dtype=torch.int16, device="cpu")
+	conds = npz["conds"][0].to(dtype=torch.int16, device="cpu")
+	latent = npz["latent"][0].to(dtype=torch.int16, device="cpu")
 
 	metadata = {}
 
-	if "text" in npz["metadata"]:
-		metadata["text"] = npz["metadata"]["text"]
+	if "text" in npz:
+		metadata["text"] = npz["text"]
 	
 	if "phonemes" in npz["metadata"]:
 		metadata["phonemes"] = npz["metadata"]["phonemes"]
@@ -616,10 +623,15 @@ def unpack_audio( npz ):
 	if "language" in npz["metadata"]:
 		metadata["language"] = npz["metadata"]["language"]
 	
-	if "original_length" in npz["metadata"] and "sample_rate" in npz["metadata"]:
+	if "original_length" in npz["metadata"]:
+		metadata["wav_length"] = npz["metadata"]["original_length"]
+
+	if "duration" in npz["metadata"]:
+		metadata["duration"] = npz["metadata"]["duration"]
+	elif "original_length" in npz["metadata"] and "sample_rate" in npz["metadata"]:
 		metadata["duration"] = npz["metadata"]["original_length"] / npz["metadata"]["sample_rate"]
 
-	return mel, metadata
+	return mel, conds, latent, metadata
 
 # parse dataset into better to sample metadata
 def create_dataset_metadata( skip_existing=True ):
@@ -672,7 +684,7 @@ def create_dataset_metadata( skip_existing=True ):
 				if audios:
 					# ideally we'll encode Encodec-based audio in a similar manner because np has smaller files than pt
 					npz = np.load(f'{root}/{name}/{id}{_get_mel_extension()}', allow_pickle=True)[()]
-					mel, utterance_metadata = unpack_audio( npz )
+					mel, conds, latents, utterance_metadata = unpack_audio( npz )
 				# text
 				if texts and text_exists and not utterance_metadata:
 					utterance_metadata = json.loads(open(f'{root}/{name}/{id}{_get_phone_extension()}', "r", encoding="utf-8").read())
@@ -755,10 +767,16 @@ def create_dataset_hdf5( skip_existing=True ):
 				# audio
 				if audios:
 					npz = np.load(f'{root}/{name}/{id}{_get_mel_extension()}', allow_pickle=True)[()]
-					mel, utterance_metadata = unpack_audio( npz )
+					mel, conds, latents, utterance_metadata = unpack_audio( npz )
 
 					if "audio" not in group:
 						group.create_dataset('audio', data=mel.numpy().astype(np.int16), compression='lzf')
+					
+					if "conds" not in group:
+						group.create_dataset('conds', data=conds.numpy().astype(np.int16), compression='lzf')
+					
+					if "latents" not in group:
+						group.create_dataset('latents', data=latents.numpy().astype(np.int16), compression='lzf')
 
 				# text
 				if texts:
@@ -778,6 +796,7 @@ def create_dataset_hdf5( skip_existing=True ):
 
 			except Exception as e:
 				tqdm.write(f'Error while processing {id}: {e}')
+				raise e
 
 		with open(str(metadata_path), "w", encoding="utf-8") as f:
 			f.write( json.dumps( metadata ) )
@@ -837,27 +856,9 @@ if __name__ == "__main__":
 
 		samples = {
 			"training": [ next(iter(train_dl)),  next(iter(train_dl)) ],
-			"evaluation": [ next(iter(subtrain_dl)),  next(iter(subtrain_dl)) ],
-			"validation": [ next(iter(val_dl)),  next(iter(val_dl)) ],
+			#"evaluation": [ next(iter(subtrain_dl)),  next(iter(subtrain_dl)) ],
+			#"validation": [ next(iter(val_dl)),  next(iter(val_dl)) ],
 		}
-
-		Path("./data/sample-test/").mkdir(parents=True, exist_ok=True)
-
-		for k, v in samples.items():
-			for i in range(len(v)):
-				for j in tqdm(range(len(v[i]['proms'])), desc="Decoding..."):
-					"""
-					try:
-						decode_to_file( v[i]['proms'][j], f"./data/sample-test/{k}.{i}.{j}.proms.wav", device="cpu" )
-					except Exception as e:
-						print(f"Error while decoding prom {k}.{i}.{j}.wav:", str(e))
-					try:
-						decode_to_file( v[i]['resps'][j], f"./data/sample-test/{k}.{i}.{j}.resps.wav", device="cpu" )
-					except Exception as e:
-						print(f"Error while decoding resp {k}.{i}.{j}.wav:", str(e))
-					"""
-					v[i]['proms'][j] = v[i]['proms'][j].shape
-					v[i]['resps'][j] = v[i]['resps'][j].shape
 		
 		for k, v in samples.items():
 			for i in range(len(v)):

@@ -502,7 +502,7 @@ class Optimizations:
 	optimizers: bool = True # inject/replace optimizers (BnB, DAdaptation)
 	
 	bitsandbytes: bool = False # use bitsandbytes
-	dadaptation: bool = True # use dadaptation optimizer
+	dadaptation: bool = False # use dadaptation optimizer
 	bitnet: bool = False # use bitnet
 	fp8: bool = False # use fp8
 
@@ -525,6 +525,7 @@ class Config(BaseConfig):
 	tokenizer: str = "./tokenizer.json"
 
 	sample_rate: int = 24_000
+	audio_backend: str = "mel"
 
 	@property
 	def model(self):
