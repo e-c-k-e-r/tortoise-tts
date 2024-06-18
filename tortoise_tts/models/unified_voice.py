@@ -273,9 +273,14 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
 							 n_embd=model_dim,
 							 n_layer=layers,
 							 n_head=heads,
-							 gradient_checkpointing=checkpointing,
 							 use_cache=not checkpointing)
 	gpt = GPT2Model(gpt_config)
+
+	if checkpointing:
+		gpt.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(
+			use_reentrant=False
+		))
+
 	# Override the built in positional embeddings
 	del gpt.wpe
 	gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)

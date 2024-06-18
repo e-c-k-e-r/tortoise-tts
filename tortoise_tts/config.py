@@ -175,6 +175,7 @@ class Dataset:
 class Model:
 	name: str = "" # vanity name for the model
 	training: bool = False
+	frozen_params: list[str] = field(default_factory=lambda: []) # frozen parameters that are not updated when training
 
 	def get(self, name=None):
 		return [ self ] if not name or self.name == name else []
@@ -190,7 +191,7 @@ class Model:
 
 	@property
 	def lora_policy(self):
-		include = ["model"] # by default only adapt the main model (not embeddings nor classifier/output projection/LM head/whatever)
+		include = ["gpt"] # by default only adapt the main model (not embeddings nor classifier/output projection/LM head/whatever)
 		exclude = []
 
 		return dict(include=include, exclude=exclude)
@@ -202,6 +203,8 @@ class LoRA:
 	rank: int = 8 # rank for the LoRA
 	alpha: int = 16 # rank for the LoRA
 	training: bool = True # 
+	parametrize: bool = False # 
+	module: str = "linear" # linear | conv1d
 
 	@property
 	def full_name(self):

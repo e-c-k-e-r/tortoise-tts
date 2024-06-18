@@ -56,9 +56,11 @@ def load_engines(training=True):
 			model.model = ml.replace_embedding( model.model )
 
 		for lora in cfg.loras:
-			model.model = apply_lora( model.model, rank = lora.rank, alpha = lora.alpha, policy = model.config.lora_policy )
+			if hasattr(model, "gpt"):
+				#model.gpt = apply_lora( model.gpt, rank = lora.rank, alpha = lora.alpha, policy = model.config.lora_policy, parametrize = lora.parametrize )
+				model = apply_lora( model, rank = lora.rank, alpha = lora.alpha, policy = model.config.lora_policy, use_parametrize = lora.parametrize )
 
-		if backend == "local" or (backend == "deepspeed" and cfg.hyperparameters.torch_optimizer):
+		if not inferencing and (backend == "local" or (backend == "deepspeed" and cfg.hyperparameters.torch_optimizer)):
 			optimizer_class = None
 			scheduler_class = None
 
@@ -124,7 +126,7 @@ def load_engines(training=True):
 			loads_state_dict = True
 	
 		stats = None
-		if loads_state_dict:
+		if loads_state_dict and load_path.exists():
 			state = torch.load(load_path, map_location=torch.device(cfg.device))
 
 			# state dict is not just the module, extract the extra trainer details

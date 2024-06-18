@@ -59,8 +59,8 @@ def get_model(config, training=True):
 	name = config.name
 
 	model = load_model(config.name)
-
-	config.training = False
+	config.training = "autoregressive" in config.name
+	model.config = config
 
 	print(f"{name} ({next(model.parameters()).dtype}): {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters")
 

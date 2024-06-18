@@ -29,12 +29,14 @@ mel_stft_loss = auraloss.freq.MelSTFTLoss(cfg.sample_rate, device="cpu")
 
 def train_feeder(engine, batch):
 	with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
+		device = batch["text"][0].device
+		batch_size = len(batch["text"])
+
 		conditioning_latents = pad_sequence([ latents[0] for latents in batch["latents"] ], batch_first = True)
 		text_inputs = pad_sequence([ text for text in batch["text"] ], batch_first = True)
-		text_lengths = pad_sequence([ text.shape[0] for text in batch["text"] ], batch_first = True)
-		mel_codes = pad_sequence([ code for codes in batch["mel"] ], batch_first = True)
-		wav_lengths = pad_sequence([ length for  length in batch["wav_length"] ], batch_first = True)
-
+		text_lengths = torch.Tensor([ text.shape[0] for text in batch["text"] ]).to(dtype=torch.int32)
+		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True)
+		wav_lengths = torch.Tensor([ x for x in batch["wav_length"] ]).to(dtype=torch.int32)
 
 		engine.forward(conditioning_latents, text_inputs, text_lengths, mel_codes, wav_lengths)
 
@@ -48,7 +50,7 @@ def train_feeder(engine, batch):
 	stats |= {k: v.item() for k, v in stat.items()}
 
 	engine.tokens_processed += sum([ text.shape[0] for text in batch["text"] ])
-	engine.tokens_processed += sum([ resps.shape[0] for resps in batch["resps"] ])
+	engine.tokens_processed += sum([ mel.shape[-1] for mel in batch["mel"] ])
 
 	return loss, stats
 
@@ -76,9 +78,11 @@ def run_eval(engines, eval_name, dl):
 			ref_path.parent.mkdir(parents=True, exist_ok=True)
 			prom_path.parent.mkdir(parents=True, exist_ok=True)
 			
+			"""
 			ref_audio, sr = qnt.decode_to_file(ref, ref_path)
 			hyp_audio, sr = qnt.decode_to_file(hyp, hyp_path)
 			prom_audio, sr = qnt.decode_to_file(prom, prom_path)
+			"""
 
 			# pseudo loss calculation since we don't get the logits during eval
 			min_length = min( ref_audio.shape[-1], hyp_audio.shape[-1] )
@@ -137,10 +141,10 @@ def train():
 			print(traceback.format_exc())
 
 		engines.train()
-		qnt.unload_model()
+		#qnt.unload_model()
 		do_gc()
 
-	qnt.unload_model()
+	#qnt.unload_model()
 
 	if args.eval:
 		return eval_fn(engines=trainer.load_engines())

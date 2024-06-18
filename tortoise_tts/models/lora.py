@@ -4,18 +4,17 @@ import torch
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
+from transformers.pytorch_utils import Conv1D
+
 from torch import Tensor, nn
 
 import math
 from typing import Optional, List
 
-# to-do: set cfg to decide
-USE_PARAMETRIZATION = True
-
 # LoRA Linear for replacement
 # Pros: simple, just needs to reuse the replace_linear and copy weights
 # Cons: does not work with other Linears (bnb, bitnet, te's fp8, etc), cannot apply multiple LoRAs (although for audio why would you)
-class Linear(nn.Linear):
+class LoRALinear(nn.Linear):
 	def __init__(
 		self, 
 		
@@ -27,7 +26,7 @@ class Linear(nn.Linear):
 		alpha: int = 1, 
 		
 		dropout: float = 0.1,
-		merge_weights: bool = True,
+		merge_weights: bool = False,
 		**kwargs,
 	):
 		super().__init__(in_features=in_features, out_features=out_features, bias=bias, **kwargs)
@@ -37,6 +36,7 @@ class Linear(nn.Linear):
 		self.dropout = nn.Dropout(p=dropout) if dropout > 0 else lambda x: x
 		self.merge_weights = merge_weights
 		self.merged = False
+		self.enabled = True
 
 		self.lora_B = nn.Parameter( self.weight.new_zeros( (out_features, rank) ) )
 		self.lora_A = nn.Parameter( self.weight.new_zeros( (rank, in_features) ) )
@@ -67,7 +67,7 @@ class Linear(nn.Linear):
 			self.merged = True   
 
 	def forward(self, x: torch.Tensor):
-		if not self.merged:
+		if not self.merged and self.enabled:
 			result = F.linear(x, self.weight, bias=self.bias)			
 			result += (self.dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
 			return result
@@ -85,7 +85,7 @@ class Linear(nn.Linear):
 # Uses parametrization to inject LoRA weights
 # Pros: should work with any Linears
 # Cons: TBD
-class ParameterizedLinear(nn.Module):
+class ParameterizedLoRA(nn.Module):
 	def __init__(
 		self, 
 		
@@ -120,7 +120,6 @@ class ParameterizedLinear(nn.Module):
 	def forward(self, x: torch.Tensor):
 		if self.enabled:
 			return x + torch.matmul(self.lora_B, self.dropout(self.lora_A)).view(x.shape) * self.scaling
-
 		return x
 
 	@classmethod
@@ -133,10 +132,21 @@ class ParameterizedLinear(nn.Module):
 		# M$'s LoRA class arranges things to where this isn't necessary
 		return cls( in_features = layer.out_features, out_features = layer.in_features, bias = layer.bias is not None, **kwargs ).to(device=device, dtype=dtype)
 
+	@classmethod
+	def from_conv1d( cls, layer, device = None, dtype = None, **kwargs ):
+		if device is None:
+			device = layer.weight.device
+		if dtype is None:
+			dtype = layer.weight.dtype
+
+		in_channels, out_channels = layer.weight.shape
+		# swap because we're feeding the output as our input
+		# M$'s LoRA class arranges things to where this isn't necessary
+		return cls( in_features = out_channels, out_features = in_channels, bias = layer.bias is not None, **kwargs ).to(device=device, dtype=dtype)
+
 def passes_policy( policy, name ):
 	if policy is None:
 		return True
-
 	if "exclude" in policy:
 		for term in policy["exclude"]:
 			if term in name:
@@ -149,29 +159,49 @@ def passes_policy( policy, name ):
 
 	return False
 
-
-def apply_lora( model, register = True, merge = False, policy = None, **kwargs ):
+def apply_lora( model, register = True, merge = False, policy = None, use_parametrize = False, **kwargs ):
 	device =  next(model.parameters()).device
 	dtype = next(model.parameters()).dtype
 
-	klass = Linear
-	target = nn.Linear
-
-	device =  next(model.parameters()).device
-	dtype = next(model.parameters()).dtype
-	modules = [ k.split('.') for k, m in model.named_modules() if isinstance(m, target) and not isinstance(m, klass) and passes_policy( policy, k ) ]
+	modules = [ k.split('.') for k, m in model.named_modules() if passes_policy( policy, k ) ]
 
 	for *parent, k in modules:
 		name = '.'.join(parent)
 		layer = getattr( model.get_submodule(name), k )
 
-		if USE_PARAMETRIZATION:
-			parametrize.register_parametrization( layer, "weight", ParameterizedLinear.from_linear( layer, device=device, dtype=dtype, **kwargs ) )
-			# parametrize.remove_parametrizations( layer, "weight", leave_parametrized=merge )
+		if isinstance( layer, nn.Linear ):
+			target = nn.Linear
+			klass = ParameterizedLoRA if use_parametrize else LoRALinear
+			replacer = klass.from_linear
+		elif isinstance( layer, nn.Conv1d ):
+			target = nn.Conv1d
+			klass = ParameterizedLoRA if use_parametrize else LoRAConv1d
+			replacer = klass.from_conv1d
+		elif isinstance( layer, Conv1D ):
+			target = Conv1D
+			klass = ParameterizedLoRA if use_parametrize else LoRAConv1d
+			replacer = klass.from_conv1d
 		else:
-			setattr( model.get_submodule(name), k, Linear.from_linear( layer, device=device, dtype=dtype, **kwargs ) )
+			continue
+		
+		replacement = replacer( layer, device=device, dtype=dtype, **kwargs )
+
+		if use_parametrize:
+			parametrize.register_parametrization( layer, "weight", replacement )
+		else:
+			setattr( model.get_submodule(name), k, replacement )
 
 	return model
+
+def enable_lora( model, mode = True ):
+	for name, module in model.named_modules():
+		if not isinstance( module, ParameterizedLoRA ) and not isinstance( module, LoRALinear ):
+			continue
+		module.enabled = mode
+	return model
+
+def disable_lora( model ):
+	return enable_lora( model, False )
 
 def freeze_non_lora_weights( model ):
 	for name, param in model.named_parameters():

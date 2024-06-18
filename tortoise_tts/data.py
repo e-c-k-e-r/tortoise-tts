@@ -497,9 +497,13 @@ class Dataset(_Dataset):
 			if key not in cfg.hdf5:
 				raise RuntimeError(f'Key of Path ({path}) not in HDF5: {key}')
 
-			text = cfg.hdf5[key]["text"][:]
-			mel = cfg.hdf5[key]["audio"][:]
-			latents = cfg.hdf5[key]["latents"][:]
+			try:
+				text = cfg.hdf5[key]["text"][:]
+				mel = cfg.hdf5[key]["audio"][:]
+				latents = cfg.hdf5[key]["latents"][:]
+			except Exception as e:
+				print( key, cfg.hdf5[key].keys() )
+				raise e
 			
 			text = torch.from_numpy(text).to(self.text_dtype)
 			mel = torch.from_numpy(mel).to(torch.int16)
