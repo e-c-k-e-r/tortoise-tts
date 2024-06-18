@@ -20,6 +20,8 @@ from .utils.distributed import world_size
 
 # Yuck
 from transformers import PreTrainedTokenizerFast
+from tokenizers import Tokenizer
+
 
 @dataclass()
 class BaseConfig:
@@ -494,6 +496,177 @@ class Inference:
 			return torch.float8_e4m3fn
 		return torch.float32
 
+import inflect
+import re
+
+# Regular expression matching whitespace:
+from unidecode import unidecode
+
+_whitespace_re = re.compile(r'\s+')
+
+# List of (regular expression, replacement) pairs for abbreviations:
+_abbreviations = [(re.compile('\\b%s\\.' % x[0], re.IGNORECASE), x[1]) for x in [
+	('mrs', 'misess'),
+	('mr', 'mister'),
+	('dr', 'doctor'),
+	('st', 'saint'),
+	('co', 'company'),
+	('jr', 'junior'),
+	('maj', 'major'),
+	('gen', 'general'),
+	('drs', 'doctors'),
+	('rev', 'reverend'),
+	('lt', 'lieutenant'),
+	('hon', 'honorable'),
+	('sgt', 'sergeant'),
+	('capt', 'captain'),
+	('esq', 'esquire'),
+	('ltd', 'limited'),
+	('col', 'colonel'),
+	('ft', 'fort'),
+]]
+
+
+def expand_abbreviations(text):
+	for regex, replacement in _abbreviations:
+		text = re.sub(regex, replacement, text)
+	return text
+
+
+_inflect = inflect.engine()
+_comma_number_re = re.compile(r'([0-9][0-9\,]+[0-9])')
+_decimal_number_re = re.compile(r'([0-9]+\.[0-9]+)')
+_pounds_re = re.compile(r'£([0-9\,]*[0-9]+)')
+_dollars_re = re.compile(r'\$([0-9\.\,]*[0-9]+)')
+_ordinal_re = re.compile(r'[0-9]+(st|nd|rd|th)')
+_number_re = re.compile(r'[0-9]+')
+
+
+def _remove_commas(m):
+	return m.group(1).replace(',', '')
+
+
+def _expand_decimal_point(m):
+	return m.group(1).replace('.', ' point ')
+
+
+def _expand_dollars(m):
+	match = m.group(1)
+	parts = match.split('.')
+	if len(parts) > 2:
+		return match + ' dollars' # Unexpected format
+	dollars = int(parts[0]) if parts[0] else 0
+	cents = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+	if dollars and cents:
+		dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+		cent_unit = 'cent' if cents == 1 else 'cents'
+		return '%s %s, %s %s' % (dollars, dollar_unit, cents, cent_unit)
+	elif dollars:
+		dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+		return '%s %s' % (dollars, dollar_unit)
+	elif cents:
+		cent_unit = 'cent' if cents == 1 else 'cents'
+		return '%s %s' % (cents, cent_unit)
+	else:
+		return 'zero dollars'
+
+
+def _expand_ordinal(m):
+	return _inflect.number_to_words(m.group(0))
+
+
+def _expand_number(m):
+	num = int(m.group(0))
+	if num > 1000 and num < 3000:
+		if num == 2000:
+			return 'two thousand'
+		elif num > 2000 and num < 2010:
+			return 'two thousand ' + _inflect.number_to_words(num % 100)
+		elif num % 100 == 0:
+			return _inflect.number_to_words(num // 100) + ' hundred'
+		else:
+			return _inflect.number_to_words(num, andword='', zero='oh', group=2).replace(', ', ' ')
+	else:
+		return _inflect.number_to_words(num, andword='')
+
+
+def normalize_numbers(text):
+	text = re.sub(_comma_number_re, _remove_commas, text)
+	text = re.sub(_pounds_re, r'\1 pounds', text)
+	text = re.sub(_dollars_re, _expand_dollars, text)
+	text = re.sub(_decimal_number_re, _expand_decimal_point, text)
+	text = re.sub(_ordinal_re, _expand_ordinal, text)
+	text = re.sub(_number_re, _expand_number, text)
+	return text
+
+
+def expand_numbers(text):
+	return normalize_numbers(text)
+
+
+def lowercase(text):
+	return text.lower()
+
+
+def collapse_whitespace(text):
+	return re.sub(_whitespace_re, ' ', text)
+
+
+def convert_to_ascii(text):
+	return unidecode(text)
+
+
+def basic_cleaners(text):
+	'''Basic pipeline that lowercases and collapses whitespace without transliteration.'''
+	text = lowercase(text)
+	text = collapse_whitespace(text)
+	return text
+
+
+def transliteration_cleaners(text):
+	'''Pipeline for non-English text that transliterates to ASCII.'''
+	text = convert_to_ascii(text)
+	text = lowercase(text)
+	text = collapse_whitespace(text)
+	return text
+
+
+def english_cleaners(text):
+	'''Pipeline for English text, including number and abbreviation expansion.'''
+	text = convert_to_ascii(text)
+	text = lowercase(text)
+	text = expand_numbers(text)
+	text = expand_abbreviations(text)
+	text = collapse_whitespace(text)
+	text = text.replace('"', '')
+	return text
+
+class VoiceBpeTokenizer:
+	def __init__(self, tokenizer_file=None):
+		if tokenizer_file is not None:
+			self.tokenizer = Tokenizer.from_file(tokenizer_file)
+
+	def preprocess_text(self, txt):
+		txt = english_cleaners(txt)
+		return txt
+
+	def encode(self, txt):
+		txt = self.preprocess_text(txt)
+		txt = txt.replace(' ', '[SPACE]')
+		return self.tokenizer.encode(txt).ids
+
+	def decode(self, seq):
+		if isinstance(seq, torch.Tensor):
+			seq = seq.cpu().numpy()
+		txt = self.tokenizer.decode(seq, skip_special_tokens=False).replace(' ', '')
+		txt = txt.replace('[SPACE]', ' ')
+		txt = txt.replace('[STOP]', '')
+		txt = txt.replace('[UNK]', '')
+		return txt
+
+	def get_vocab(self):
+		return self.tokenizer.get_vocab()
+
 # should be renamed to optimizations
 @dataclass()
 class Optimizations:
@@ -667,39 +840,16 @@ class Config(BaseConfig):
 		# load tokenizer
 		try:
 			from transformers import PreTrainedTokenizerFast
-			cfg.tokenizer = (cfg.rel_path if cfg.yaml_path is not None else Path("./data/")) / cfg.tokenizer
-			cfg.tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(cfg.tokenizer))
+			#cfg.tokenizer = (cfg.rel_path if cfg.yaml_path is not None else Path("./data/")) / cfg.tokenizer
+			tokenizer_path = cfg.rel_path / cfg.tokenizer
+			if not tokenizer_path.exists():
+				tokenizer_path = Path("./data/") / cfg.tokenizer
+
+			#cfg.tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_path))
+			cfg.tokenizer = VoiceBpeTokenizer(tokenizer_file=str(tokenizer_path))
 		except Exception as e:
-			cfg.tokenizer = NaiveTokenizer()
 			print("Error while parsing tokenizer:", e)
-			pass
-
-
-# Preserves the old behavior
-class NaiveTokenizer:
-	def get_vocab( self ):
-		"""
-		if cfg.dataset.use_hdf5 and 'symmap' in cfg.hdf5:
-			return json.loads( cfg.hdf5['symmap'].asstr()[()] )
-		"""
-		return {'<s>': 1, '</s>': 2, ' ': 3, '.': 4, ',': 5, '!': 6, '?': 7, 'p': 7, 'iː': 8, 'ɚ': 9, 'ˌ': 10, 'dˌ': 11, 'mˌ': 12, 'd': 13, 'ɹ': 14, 'tˈ': 15, 'pˌ': 16, 'uː': 17, 'l': 18, 'æ': 19, 'ɛ': 20, 'ɪ': 21, 'j': 22, 'ʊ': 23, 't': 24, 'n': 25, 'v': 26, 'a': 27, 'o': 28, 'ŋ': 29, 'w': 30, 'ʌ': 31, 'hˈ': 32, 'ɡˈ': 33, 'ə': 34, 'θˈ': 35, 'dˈ': 36, 'wˌ': 37, 'h': 38, 'z': 39, 'k': 40, 'ð': 41, 'ɡˌ': 42, 'ˈ': 43, 'fˈ': 44, 'i': 45, 's': 46, 'ʃ': 47, 'wˈ': 48, 'ðˈ': 49, 'ɹˈ': 50, 'lˈ': 51, 'ɡ': 52, 'oː': 53, 'mˈ': 54, 'e': 55, 'ɑː': 56, 'nˈ': 57, 'm': 58, 'θˌ': 59, 'sˈ': 60, 'f': 61, 'ɔː': 62, 'hˌ': 63, 'b': 64, 'jˈ': 65, 'ɐ': 66, 'ʒˈ': 67, 'θ': 68, 'bˈ': 69, 'ɾ': 70, 'ɜː': 71, 'ʌˈ': 72, 'ʃˌ': 73, 'bˌ': 74, 'kˈ': 75, 'ɔ': 76, 'zˈ': 77, 'ᵻ': 78, 'kˌ': 79, 'vˈ': 80, 'fˌ': 81, 'ʒ': 82, 'ʃˈ': 83, 'ɹˌ': 84, 'tˌ': 85, 'pˈ': 86, 'ðˌ': 87, 'sˌ': 88, 'nˌ': 89, 'lˌ': 90, '̩': 91, 'ʔ': 92, 'vˌ': 93, 'ɪˈ': 94, '"': 95, 'ɪˌ': 96, 'ʒˌ': 97, 'uːˌ': 98, 'ʊˈ': 99, 'jˌ': 100, 'uːˈ': 101, 'iːˈ': 102, 'zˌ': 103, '.ˈ': 104, '…': 105, 'ŋˌ': 106, 'ɐˌ': 107, '—ˈ': 108, 'iˌ': 109, 'iːˌ': 110, 'ɛː': 111, ')': 112, ')ˈ': 113, '(': 114, 'u': 115, '-': 116, 'ɖˈ': 117, 'iˈ': 118, 'ʰˈ': 119, 'ɟˈ': 120, '̃': 121, 'eː': 122, 'ɾˈ': 123, 'r': 124, 'ʰ': 125, '-ˌ': 126, 'ɫ': 127, 'q': 128, '—': 129, 'ʊˌ': 130, 'aː': 131, 'cˈ': 132, '…ˈ': 133, 'c': 134, 'ɳ': 135, 'ɐˈ': 136, 'x': 137, 'ʔˌ': 138, '.ˌ': 139, 'ɑ': 140, '?ˈ': 141, '̩ˈ': 142, '"ˈ': 143, ',ˈ': 144, 'ŋˈ': 145, 'əˌ': 146, '!ˈ': 147, '"ˌ': 148, '?ˌ': 149, ',ˌ': 150, '—ˌ': 151, '̩ˌ': 152, 'əˈ': 153, '!ˌ': 154, 'ɬ': 155, 'ʲ': 156, '¡': 157, 'ɯ': 158, 'qˌ': 159, 'ʑ': 160, 'ʑˈ': 161, '¿': 162, 'ɑːˈ': 163, 'iːː': 164, 'ɛˈ': 165, '¡ˈ': 166, 'æˈ': 167, 'ç': 168, 'ɾˌ': 169, 'ᵻˈ': 170, 'xˈ': 171, 'ɔːˈ': 172, ';': 173, 'ɬˌ': 174, ':': 175, 'ʔˈ': 176, 'ɑːˌ': 177, 'ɬˈ': 178, '”': 179, '“': 180, '“ˈ': 181, '“ˌ': 182, ';ˈ': 183, ';ˌ': 184, ':ˈ': 185, '1': 186, 'rˈ': 187, 'qˈ': 188, 'ᵻˌ': 189, 'ä': 190, '̞ˌ': 191, '̞': 192, 'ũˌ': 193, 'ʑˌ': 194, 'ᵝ': 195, 'ɽ': 196, 'ʲˌ': 197, 'ᵝˌ': 198, 'ũ': 199, 'ũˈ': 200, 'äˌ': 201, 'ɕ': 202, 'ɕˌ': 203, 'ɽˌ': 204, 'çˌ': 205, '…ˌ': 206, '̞ˈ': 207, 'äˈ': 208, 'ɽˈ': 209, 'ɸˌ': 210, 'ɴ': 211, 'ɸˈ': 212, 'ɕˈ': 213, 'ɸ': 214, 'ᵝˈ': 215, 'ʲˈ': 216, 'ĩ': 217, 'çˈ': 218, 'ĩˌ': 219, 'oˌ': 220, 'eˈ': 221, 'ʍ': 222, 'eˌ': 223, 'uˌ': 224, 'ʍˌ': 225, 'uˈ': 226, 'oˈ': 227, 'aˈ': 228}
-
-	def encode( self, s ):
-		symmap = self.get_vocab()
-		phones = " ".join( list(s) )
-
-		# do merge
-		for merge in [ "\u02C8", "\u02CC", "\u02D0" ]:
-			phones = phones.replace( f' {merge}', merge )
-
-		phones = phones.split(" ")
-		# cleanup
-		phones = [ p for i, p in enumerate(phones) if p not in [" "] or ( p in [" "] and p != phones[i-1] ) ]
-		# add bos / eos
-		phones = ["<s>"] + [ " " if not p else p for p in phones ] + ["</s>"]
-		# tokenize
-		return [*map(symmap.get, phones)]
-
+			raise e
 
 cfg = Config.from_cli()
 

@@ -431,7 +431,7 @@ class Dataset(_Dataset):
 
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
-			mel = torch.from_numpy(cfg.hdf5[key]["audio"][:]).to(torch.int16)
+			mel = torch.from_numpy(cfg.hdf5[key]["audio"]).to(torch.int16)
 		else:
 			mel = _load_mels(path, return_metadata=False)
 		return mel
@@ -497,22 +497,22 @@ class Dataset(_Dataset):
 			if key not in cfg.hdf5:
 				raise RuntimeError(f'Key of Path ({path}) not in HDF5: {key}')
 
-			try:
-				text = cfg.hdf5[key]["text"][:]
-				mel = cfg.hdf5[key]["audio"][:]
-				latents = cfg.hdf5[key]["latents"][:]
-			except Exception as e:
-				print( key, cfg.hdf5[key].keys() )
-				raise e
+			text = cfg.hdf5[key]["text"][:]
+			mel = cfg.hdf5[key]["audio"][:]
+			conds = (cfg.hdf5[key]["conds_0"][:], cfg.hdf5[key]["conds_1"][:])
+			latents = (cfg.hdf5[key]["latents_0"][:], cfg.hdf5[key]["latents_1"][:])
 			
 			text = torch.from_numpy(text).to(self.text_dtype)
 			mel = torch.from_numpy(mel).to(torch.int16)
-			latents = torch.from_numpy(latents)
+			conds = (torch.from_numpy(conds[0]), torch.from_numpy(conds[1]))
+			latents = (torch.from_numpy(latents[0]), torch.from_numpy(latents[1]))
+
 			wav_length = cfg.hdf5[key].attrs["wav_length"]
 		else:
 			mel, metadata = _load_mels(path, return_metadata=True)
 			text = torch.tensor(metadata["text"]).to(self.text_dtype)
-			latents = torch.from_numpy(metadata["latent"][0])
+			conds = (torch.from_numpy(metadata["conds"][0]), torch.from_numpy(metadata["conds"][1]))
+			latents = (torch.from_numpy(metadata["latent"][0]), torch.from_numpy(metadata["latent"][1]))
 			wav_length = metadata["wav_length"]
 
 		return dict(
@@ -521,7 +521,12 @@ class Dataset(_Dataset):
 			spkr_name=spkr_name,
 			spkr_id=spkr_id,
 
-			latents=latents,
+			latents_0=latents[0][0],
+			latents_1=latents[1][0],
+			
+			conds_0=conds[0][0, 0],
+			conds_1=conds[1][0, 0],
+
 			text=text,
 			mel=mel,
 			wav_length=wav_length,
@@ -612,9 +617,10 @@ def create_train_val_dataloader():
 	return train_dl, subtrain_dl, val_dl
 
 def unpack_audio( npz ):
-	mel = npz["codes"].to(dtype=torch.int16, device="cpu")
-	conds = npz["conds"][0].to(dtype=torch.int16, device="cpu")
-	latent = npz["latent"][0].to(dtype=torch.int16, device="cpu")
+	mel = npz["codes"].to(device="cpu")
+	
+	conds = npz["conds"][0].to(device="cpu"), npz["conds"][1].to(device="cpu")
+	latent = npz["latent"][0].to(device="cpu"), npz["latent"][1].to(device="cpu")
 
 	metadata = {}
 
@@ -774,13 +780,15 @@ def create_dataset_hdf5( skip_existing=True ):
 					mel, conds, latents, utterance_metadata = unpack_audio( npz )
 
 					if "audio" not in group:
-						group.create_dataset('audio', data=mel.numpy().astype(np.int16), compression='lzf')
+						group.create_dataset('audio', data=mel.numpy(), compression='lzf')
 					
-					if "conds" not in group:
-						group.create_dataset('conds', data=conds.numpy().astype(np.int16), compression='lzf')
-					
-					if "latents" not in group:
-						group.create_dataset('latents', data=latents.numpy().astype(np.int16), compression='lzf')
+					for i, cond in enumerate(conds):
+						if f"conds_{i}" not in group:
+							group.create_dataset(f'conds_{i}', data=cond.numpy(), compression='lzf')
+						
+					for i, latent in enumerate(latents):
+						if f"latents_{i}" not in group:
+							group.create_dataset(f'latents_{i}', data=latent.numpy(), compression='lzf')
 
 				# text
 				if texts:
@@ -859,14 +867,21 @@ if __name__ == "__main__":
 		train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
 
 		samples = {
-			"training": [ next(iter(train_dl)),  next(iter(train_dl)) ],
-			#"evaluation": [ next(iter(subtrain_dl)),  next(iter(subtrain_dl)) ],
-			#"validation": [ next(iter(val_dl)),  next(iter(val_dl)) ],
+			"training": next(iter(train_dl)),
+			#"evaluation": next(iter(subtrain_dl)),
+			#"validation": next(iter(val_dl)),
 		}
+
+		for sample_name, sample_batch in samples.items():
+			for name, batch in sample_batch.items():
+				#print( name, [ x.shape if hasattr(x, "shape") else x for x in batch ] )
+				print( name, [ x for x in batch ] )
 		
+		"""
 		for k, v in samples.items():
 			for i in range(len(v)):
 				print(f'{k}[{i}]:', v[i])
+		"""
 
 	elif args.action == "tasks":
 		index = 0
