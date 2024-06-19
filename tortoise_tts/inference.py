@@ -103,7 +103,7 @@ class TTS():
 		max_diffusion_steps=80,
 		#max_ar_context=-1,
 		#input_prompt_length=0.0,
-		ar_temp=1.0,
+		ar_temp=0.8,
 		diffusion_temp=1.0,
 		#min_ar_temp=0.95,
 		#min_diffusion_temp=0.5,
@@ -131,8 +131,6 @@ class TTS():
 		clvp = None
 		vocoder = None
 		diffuser = get_diffuser(steps=max_diffusion_steps, cond_free=cond_free)
-
-		autoregressive_latents, diffusion_latents = self.encode_audio( references )["latent"]
 		
 		for name, engine in self.engines.items():
 			if "autoregressive" in name:
@@ -152,6 +150,10 @@ class TTS():
 			clvp = load_model("clvp", device=cfg.device)
 		if vocoder is None:
 			vocoder = load_model("vocoder", device=cfg.device)
+		
+		autoregressive = autoregressive.to(cfg.device)
+		diffusion = diffusion.to(cfg.device)
+		autoregressive_latents, diffusion_latents = self.encode_audio( references )["latent"]
 
 		# shove everything to cpu
 		if cfg.inference.auto_unload:
@@ -163,6 +165,8 @@ class TTS():
 		wavs = []
 		# other vars
 		calm_token = 832
+
+		candidates = 1
 
 		for line in lines:
 			if out_path is None:
@@ -185,7 +189,7 @@ class TTS():
 						do_sample=True,
 						top_p=top_p,
 						temperature=ar_temp,
-						num_return_sequences=1,
+						num_return_sequences=candidates,
 						length_penalty=length_penalty,
 						repetition_penalty=repetition_penalty,
 						max_generate_length=max_ar_steps,
@@ -213,12 +217,13 @@ class TTS():
 
 					wav_lengths = torch.tensor([codes.shape[-1] * autoregressive.mel_length_compression], device=text_tokens.device)
 
+					# to-do: actually move this after the CLVP to get the best latents instead
 					latents = autoregressive.forward(
-						autoregressive_latents,
-						text_tokens,
-						text_lengths,
+						autoregressive_latents if candidates <= 1 else autoregressive_latents.repeat(candidates, 1),
+						text_tokens if candidates <= 1 else text_tokens.repeat(candidates, 1),
+						text_lengths if candidates <= 1 else text_lengths.repeat(candidates, 1),
 						codes,
-						wav_lengths,
+						wav_lengths if candidates <= 1 else wav_lengths.repeat(candidates, 1),
 						return_latent=True,
 						clip_inputs=False
 					)
@@ -232,6 +237,13 @@ class TTS():
 						if calm_tokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
 							latents = latents[:, :k]
 							break
+
+				# clvp pass
+				if candidates > 1:
+					with ml.auto_unload(clvp, enabled=cfg.inference.auto_unload):
+						scores = clvp(text_tokens.repeat(codes.shape[0], 1), codes, return_loss=False)
+						indices = torch.topk(scores, k=candidates).indices
+						codes = codes[indices]
 
 				# diffusion pass
 				with ml.auto_unload(diffusion, enabled=cfg.inference.auto_unload):
@@ -258,6 +270,6 @@ class TTS():
 					if out_path is not None:
 						torchaudio.save( out_path, wav.cpu(), sr )
 					wavs.append(wav)
-		
+
 		return (torch.concat(wavs, dim=-1), sr)
 		

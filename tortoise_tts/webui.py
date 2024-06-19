@@ -219,8 +219,8 @@ with ui:
 					layout["inference"]["inputs"]["diffusion-sampler"] = gr.Radio( ["P", "DDIM"], value="DDIM", label="Diffusion Samplers", type="value", info="Sampler to use during the diffusion pass." )
 					layout["inference"]["inputs"]["cond-free"] = gr.Checkbox(label="Cond. Free", value=True, info="Condition Free diffusion")
 				with gr.Row():
-					layout["inference"]["inputs"]["ar-temp"] = gr.Slider(value=0.95, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (AR)", info="Modifies the randomness from the samples in the AR. (0 to greedy sample)")
-					layout["inference"]["inputs"]["diffusion-temp"] = gr.Slider(value=0.01, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (Diffusion)", info="Modifies the initial noise during the diffusion pass.")
+					layout["inference"]["inputs"]["ar-temp"] = gr.Slider(value=0.8, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (AR)", info="Modifies the randomness from the samples in the AR. (0 to greedy sample)")
+					layout["inference"]["inputs"]["diffusion-temp"] = gr.Slider(value=1.0, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (Diffusion)", info="Modifies the initial noise during the diffusion pass.")
 				"""
 				with gr.Row():
 					layout["inference"]["inputs"]["dynamic-sampling"] = gr.Checkbox(label="Dynamic Temperature", info="Dynamically adjusts the temperature based on the highest confident predicted token per sampling step.")
