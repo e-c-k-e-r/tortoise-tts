@@ -10,6 +10,7 @@ from .diffusion import DiffusionTTS
 from .vocoder import UnivNetGenerator
 from .clvp import CLVP
 from .dvae import DiscreteVAE
+from .random_latent_generator import RandomLatentConverter
 
 import os
 import torch
@@ -20,18 +21,30 @@ DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), '
 @cache
 def load_model(name, device="cuda", **kwargs):
 	load_path = None
-	if "autoregressive" in name or "unified_voice" in name:
+	state_dict_key = None
+	strict = True
+
+	if "rlg" in name:
+		if "autoregressive" in name:
+			model = RandomLatentConverter(1024, **kwargs)
+			load_path = f'{DEFAULT_MODEL_PATH}/rlg_auto.pth'
+		if "diffusion" in name:
+			model = RandomLatentConverter(2048, **kwargs)
+			load_path = f'{DEFAULT_MODEL_PATH}/rlg_diffuser.pth'
+	elif "autoregressive" in name or "unified_voice" in name:
+		strict = False
 		model = UnifiedVoice(**kwargs)
 		load_path = f'{DEFAULT_MODEL_PATH}/autoregressive.pth'
 	elif "diffusion" in name:
 		model = DiffusionTTS(**kwargs)
-		load_path = f'{DEFAULT_MODEL_PATH}/diffusion.pth'
+		load_path = f'{DEFAULT_MODEL_PATH}/diffusion.pth'		
 	elif "clvp" in name:
 		model = CLVP(**kwargs)
 		load_path = f'{DEFAULT_MODEL_PATH}/clvp2.pth'
 	elif "vocoder" in name:
 		model = UnivNetGenerator(**kwargs)
 		load_path = f'{DEFAULT_MODEL_PATH}/vocoder.pth'
+		state_dict_key = 'model_g'
 	elif "dvae" in name:
 		load_path = f'{DEFAULT_MODEL_PATH}/dvae.pth'
 		model = DiscreteVAE(**kwargs)
@@ -44,11 +57,16 @@ def load_model(name, device="cuda", **kwargs):
 			model = TacotronSTFT(**kwargs)
 	elif "tms" in name:
 		model = TorchMelSpectrogram(**kwargs)
-	
+
 	model = model.to(device=device)
 
 	if load_path is not None:
-		model.load_state_dict(torch.load(load_path, map_location=device), strict=False)
+		state_dict = torch.load(load_path, map_location=device)
+		if state_dict_key:
+			state_dict = state_dict[state_dict_key]
+		model.load_state_dict(state_dict, strict=strict)
+
+	model.eval()
 
 	return model
 

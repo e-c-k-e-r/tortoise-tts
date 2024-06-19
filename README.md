@@ -12,9 +12,9 @@ Simply run `pip install git+https://git.ecker.tech/mrq/tortoise-tts` or `pip ins
 
 ## To-Do
 
-- [ ] Reimplement original inferencing through TorToiSe (as done with `api.py`)
-- [ ] Implement training support (without DLAS)
-  - [ ] Feature parity with the VALL-E training setup with preparing a dataset ahead of time
+- [X] Reimplement original inferencing through TorToiSe (as done with `api.py`)
+- [X] Implement training support (without DLAS)
+  - [X] Feature parity with the VALL-E training setup with preparing a dataset ahead of time
 - [ ] Automagic handling of the original weights into compatible weights
 - [ ] Extend the original inference routine with additional features:
   - [x] non-float32 / mixed precision

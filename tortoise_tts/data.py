@@ -499,19 +499,19 @@ class Dataset(_Dataset):
 
 			text = cfg.hdf5[key]["text"][:]
 			mel = cfg.hdf5[key]["audio"][:]
-			conds = (cfg.hdf5[key]["conds_0"][:], cfg.hdf5[key]["conds_1"][:])
+			#conds = (cfg.hdf5[key]["conds_0"][:], cfg.hdf5[key]["conds_1"][:])
 			latents = (cfg.hdf5[key]["latents_0"][:], cfg.hdf5[key]["latents_1"][:])
 			
 			text = torch.from_numpy(text).to(self.text_dtype)
 			mel = torch.from_numpy(mel).to(torch.int16)
-			conds = (torch.from_numpy(conds[0]), torch.from_numpy(conds[1]))
+			#conds = (torch.from_numpy(conds[0]), torch.from_numpy(conds[1]))
 			latents = (torch.from_numpy(latents[0]), torch.from_numpy(latents[1]))
 
 			wav_length = cfg.hdf5[key].attrs["wav_length"]
 		else:
 			mel, metadata = _load_mels(path, return_metadata=True)
 			text = torch.tensor(metadata["text"]).to(self.text_dtype)
-			conds = (torch.from_numpy(metadata["conds"][0]), torch.from_numpy(metadata["conds"][1]))
+			#conds = (torch.from_numpy(metadata["conds"][0]), torch.from_numpy(metadata["conds"][1]))
 			latents = (torch.from_numpy(metadata["latent"][0]), torch.from_numpy(metadata["latent"][1]))
 			wav_length = metadata["wav_length"]
 
@@ -524,8 +524,8 @@ class Dataset(_Dataset):
 			latents_0=latents[0][0],
 			latents_1=latents[1][0],
 			
-			conds_0=conds[0][0, 0],
-			conds_1=conds[1][0, 0],
+			#conds_0=conds[0][0, 0],
+			#conds_1=conds[1][0, 0],
 
 			text=text,
 			mel=mel,
@@ -782,9 +782,11 @@ def create_dataset_hdf5( skip_existing=True ):
 					if "audio" not in group:
 						group.create_dataset('audio', data=mel.numpy(), compression='lzf')
 					
+					"""
 					for i, cond in enumerate(conds):
 						if f"conds_{i}" not in group:
 							group.create_dataset(f'conds_{i}', data=cond.numpy(), compression='lzf')
+					"""
 						
 					for i, latent in enumerate(latents):
 						if f"latents_{i}" not in group:

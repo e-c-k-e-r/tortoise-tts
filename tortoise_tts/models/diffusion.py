@@ -1565,6 +1565,21 @@ class DiffusionTTS(nn.Module):
 			return out, mel_pred
 		return out
 
+def get_diffuser(
+	steps=80,
+	cond_free=True,
+	cond_free_k=2,
+	trained_diffusion_steps=4000,
+):
+	return SpacedDiffusion(
+		use_timesteps=space_timesteps(trained_diffusion_steps, [steps]),
+		model_mean_type='epsilon',
+		model_var_type='learned_range',
+		loss_type='mse',
+		betas=get_named_beta_schedule('linear', trained_diffusion_steps),
+		conditioning_free=cond_free,
+		conditioning_free_k=cond_free_k
+	)
 
 if __name__ == '__main__':
 	clip = torch.randn(2, 100, 400)

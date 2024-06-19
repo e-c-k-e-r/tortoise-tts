@@ -25,7 +25,8 @@ import argparse
 from torch.nn.utils.rnn import pad_sequence
 
 from .models.arch_utils import denormalize_tacotron_mel
-from .models.diffusion import SpacedDiffusion, space_timesteps, get_named_beta_schedule
+from .models.diffusion import get_diffuser
+from .models import load_model
 
 _logger = logging.getLogger(__name__)
 
@@ -36,15 +37,12 @@ def train_feeder(engine, batch):
 		device = batch["text"][0].device
 		batch_size = len(batch["text"])
 
-		autoregressive_conds = torch.stack([ conds for conds in batch["conds_0"] ])
-		diffusion_conds = torch.stack([ conds for conds in batch["conds_1"] ])
-
 		autoregressive_latents = torch.stack([ latents for latents in batch["latents_0"] ])
 		diffusion_latents = torch.stack([ latents for latents in batch["latents_1"] ])
 
 		text_tokens = pad_sequence([ text for text in batch["text"] ], batch_first = True)
 		text_lengths = torch.Tensor([ text.shape[0] for text in batch["text"] ]).to(dtype=torch.int32)
-		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = engine.module.stop_mel_token )
+		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = stop_mel_token )
 		wav_lengths = torch.Tensor([ x for x in batch["wav_length"] ]).to(dtype=torch.int32)
 
 		engine.forward(autoregressive_latents, text_tokens, text_lengths, mel_codes, wav_lengths)
@@ -68,39 +66,11 @@ def run_eval(engines, eval_name, dl):
 	stats = defaultdict(list)
 	stats['loss'] = []
 
-	def process( name, batch, resps_list ):
-		for speaker, path, ref, hyp, prom, task in zip(batch["spkr_name"], batch["path"], batch["resps"], resps_list, batch["proms"], batch["task"]):
-			if len(hyp) == 0:
-				continue
-
-			filename = f'{speaker}_{path.parts[-1]}'
-
-			if task != "tts":
-				filename = f"{filename}_{task}"
-
-			# to-do, refine the output dir to be sane-er
-			ref_path = (cfg.log_dir / str(engines.global_step) / "ref" / filename).with_suffix(".wav")
-			hyp_path = (cfg.log_dir / str(engines.global_step) / name / eval_name / filename).with_suffix(".wav")
-			prom_path = (cfg.log_dir / str(engines.global_step) / name / "prom" / filename).with_suffix(".wav")
-
-			hyp_path.parent.mkdir(parents=True, exist_ok=True)
-			ref_path.parent.mkdir(parents=True, exist_ok=True)
-			prom_path.parent.mkdir(parents=True, exist_ok=True)
-			
-			ref_audio, sr = emb.decode_to_file(ref, ref_path)
-			hyp_audio, sr = emb.decode_to_file(hyp, hyp_path)
-			prom_audio, sr = emb.decode_to_file(prom, prom_path)
-
-			# pseudo loss calculation since we don't get the logits during eval
-			min_length = min( ref_audio.shape[-1], hyp_audio.shape[-1] )
-			ref_audio = ref_audio[..., 0:min_length]
-			hyp_audio = hyp_audio[..., 0:min_length]
-			stats['loss'].append(mel_stft_loss(hyp_audio[None, :, :], ref_audio[None, :, :]).item())
-	
 	autoregressive = None
 	diffusion = None
 	clvp = None
 	vocoder = None
+	diffuser = get_diffuser(steps=30, cond_free=False)
 	
 	for name in engines:
 		engine = engines[name]
@@ -113,60 +83,66 @@ def run_eval(engines, eval_name, dl):
 		elif "vocoder" in name:
 			vocoder = engine.module
 
-	trained_diffusion_steps=4000
-	desired_diffusion_steps=50
-	cond_free=False
-	cond_free_k=1
-	diffuser = SpacedDiffusion(
-		use_timesteps=space_timesteps(trained_diffusion_steps, [desired_diffusion_steps]),
-		model_mean_type='epsilon',
-		model_var_type='learned_range',
-		loss_type='mse',
-		betas=get_named_beta_schedule('linear', trained_diffusion_steps),
-		conditioning_free=cond_free,
-		conditioning_free_k=cond_free_k
-	)
+	if autoregressive is None:
+		autoregressive = load_model("autoregressive", device=cfg.device)
+	if diffusion is None:
+		diffusion = load_model("diffusion", device=cfg.device)
+	if clvp is None:
+		clvp = load_model("clvp", device=cfg.device)
+	if vocoder is None:
+		vocoder = load_model("vocoder", device=cfg.device)
 
-	processed = 0
-	temperature = 1.0
-	while processed < cfg.evaluation.size:
-		batch: dict = to_device(next(iter(dl)), cfg.device)
-		processed += len(batch["text"])
-
-		max_mel_tokens = 500
+	def generate( batch, generate_codes=True ):
+		temperature = 1.0
+		max_mel_tokens = 500 # * autoregressive.mel_length_compression
 		stop_mel_token = autoregressive.stop_mel_token
 		calm_token = 83
-		verbose = True
+		verbose = False
+
+		autoregressive_latents = torch.stack([ latents for latents in batch["latents_0"] ])
+		diffusion_latents = torch.stack([ latents for latents in batch["latents_1"] ])
+
+		text_tokens = pad_sequence([ text for text in batch["text"] ], batch_first = True)
+		text_lengths = torch.Tensor([ text.shape[0] for text in batch["text"] ]).to(dtype=torch.int32)
+		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = stop_mel_token )
+		wav_lengths = torch.Tensor([ x for x in batch["wav_length"] ]).to(dtype=torch.int32)
+
+		mel_codes = autoregressive.set_mel_padding(mel_codes, wav_lengths)
 
 		with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
-			autoregressive_conds = torch.stack([ conds for conds in batch["conds_0"] ])
-			diffusion_conds = torch.stack([ conds for conds in batch["conds_1"] ])
-
-			autoregressive_latents = torch.stack([ latents for latents in batch["latents_0"] ])
-			diffusion_latents = torch.stack([ latents for latents in batch["latents_1"] ])
-
-			text_tokens = pad_sequence([ text for text in batch["text"] ], batch_first = True)
-			text_lengths = torch.Tensor([ text.shape[0] for text in batch["text"] ]).to(dtype=torch.int32)
-			mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = stop_mel_token )
-			wav_lengths = torch.Tensor([ x for x in batch["wav_length"] ]).to(dtype=torch.int32)
-
 			# autoregressive pass
-			if True:
+			if generate_codes:
 				codes = autoregressive.inference_speech(
 					autoregressive_latents,
 					text_tokens,
 					do_sample=True,
-					#top_p=top_p,
+					top_p=0.8,
 					temperature=temperature,
 					num_return_sequences=1,
-					#length_penalty=length_penalty,
-					#repetition_penalty=repetition_penalty,
+					length_penalty=1.0,
+					repetition_penalty=2.0,
 					max_generate_length=max_mel_tokens,
 				)
 				padding_needed = max_mel_tokens - codes.shape[1]
 				codes = F.pad(codes, (0, padding_needed), value=stop_mel_token)
 			else:
 				codes = mel_codes
+
+			for i, code in enumerate( codes ):
+				stop_token_indices = (codes[i] == stop_mel_token).nonzero()
+
+				if len(stop_token_indices) == 0:
+					continue
+
+				codes[i][stop_token_indices] = 83
+				stm = stop_token_indices.min().item()
+				codes[i][stm:] = 83
+				if stm - 3 < codes[i].shape[0]:
+					codes[i][-3] = 45
+					codes[i][-2] = 45
+					codes[i][-1] = 248
+
+			wav_lengths = torch.tensor([codes.shape[-1] * autoregressive.mel_length_compression], device=text_tokens.device)
 
 			latents = autoregressive.forward(
 				autoregressive_latents,
@@ -199,18 +175,47 @@ def run_eval(engines, eval_name, dl):
 				output_shape,
 				noise=noise,
 				model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
-			    progress=verbose
+				progress=True
 			)
 			mels = denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
 
 			# vocoder pass
 			wavs = vocoder.inference(mels)
 
-			for i, wav in enumerate( wavs ):
-				torchaudio.save( f"./data/{cfg.start_time}[{i}].wav", wav.cpu(), 24_000 )
+			return wavs
 
-			# process( name, batch, resps_list )
+	def process( name, batch, hyps, refs ):
+		for speaker, path, ref_audio, hyp_audio in zip(batch["spkr_name"], batch["path"], refs, hyps):
+			filename = f'{speaker}_{path.parts[-1]}'
 
+			# to-do, refine the output dir to be sane-er
+			ref_path = (cfg.log_dir / str(engines.global_step) / "ref" / filename).with_suffix(".wav")
+			hyp_path = (cfg.log_dir / str(engines.global_step) / name / eval_name / filename).with_suffix(".wav")
+			prom_path = (cfg.log_dir / str(engines.global_step) / name / "prom" / filename).with_suffix(".wav")
+
+			hyp_path.parent.mkdir(parents=True, exist_ok=True)
+			ref_path.parent.mkdir(parents=True, exist_ok=True)
+			prom_path.parent.mkdir(parents=True, exist_ok=True)
+
+			torchaudio.save( hyp_path, hyp_audio.cpu(), 24_000 )
+			torchaudio.save( ref_path, ref_audio.cpu(), 24_000 )
+
+			# pseudo loss calculation since we don't get the logits during eval
+			min_length = min( ref_audio.shape[-1], hyp_audio.shape[-1] )
+			ref_audio = ref_audio[..., 0:min_length]
+			hyp_audio = hyp_audio[..., 0:min_length]
+			stats['loss'].append(mel_stft_loss(hyp_audio[None, :, :], ref_audio[None, :, :]).item())
+
+	processed = 0
+	while processed < cfg.evaluation.size:
+		batch = to_device(next(iter(dl)), cfg.device)
+		batch_size = len(batch["text"])
+		processed += batch_size
+
+		hyp = generate( batch, generate_codes=True )
+		ref = generate( batch, generate_codes=False )
+
+		process( name, batch, hyp, ref )
 
 	stats = {k: sum(v) / len(v) for k, v in stats.items()}
 	engines_stats = {
@@ -254,7 +259,7 @@ def train():
 		do_gc()
 
 	#qnt.unload_model()
-
+	
 	if args.eval:
 		return eval_fn(engines=trainer.load_engines())
 
