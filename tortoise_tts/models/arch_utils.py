@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 
+from pathlib import Path
 from .xtransformers import ContinuousTransformerWrapper, RelativePositionBias
 
 def zero_module(module):
@@ -289,8 +290,7 @@ class AudioMiniEncoder(nn.Module):
 		return h[:, :, 0]
 
 
-DEFAULT_MEL_NORM_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../data/mel_norms.pth')
-
+DEFAULT_MEL_NORM_FILE = Path(__file__).parent.parent.parent / 'data/models/mel_norms.pth'
 
 class TorchMelSpectrogram(nn.Module):
 	def __init__(self, filter_length=1024, hop_length=256, win_length=1024, n_mel_channels=80, mel_fmin=0, mel_fmax=8000,
@@ -310,7 +310,7 @@ class TorchMelSpectrogram(nn.Module):
 															 f_max=self.mel_fmax, n_mels=self.n_mel_channels,
 															 norm="slaney")
 		self.mel_norm_file = mel_norm_file
-		if self.mel_norm_file is not None:
+		if self.mel_norm_file is not None and self.mel_norm_file.exists():
 			self.mel_norms = torch.load(self.mel_norm_file)
 		else:
 			self.mel_norms = None

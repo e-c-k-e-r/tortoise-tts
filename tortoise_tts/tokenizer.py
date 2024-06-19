@@ -1,3 +1,6 @@
+# to-do: make use of tokenizer's configurable preprocessors
+# it *might* be required to keep all of this to maintain tokenizer compatibility
+
 import os
 import re
 

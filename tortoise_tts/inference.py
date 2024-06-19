@@ -154,7 +154,10 @@ class TTS():
 
 		for line in lines:
 			if out_path is None:
-				out_path = f"./data/{cfg.start_time}.wav"
+				output_dir = Path("./data/results/")
+				if not output_dir.exists():
+					output_dir.mkdir(parents=True, exist_ok=True)
+				out_path = output_dir / f"{cfg.start_time}.wav"
 
 			text = self.encode_text( line ).to(device=cfg.device)
 
