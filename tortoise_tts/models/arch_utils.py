@@ -42,6 +42,16 @@ def normalization(channels):
 	return GroupNorm32(groups, channels)
 
 
+AVAILABLE_ATTENTIONS = ["mem_efficient", "math", "sdpa"]
+
+try:
+	from xformers.ops import LowerTriangularMask
+	from xformers.ops.fmha import memory_efficient_attention
+
+	AVAILABLE_ATTENTIONS.append("xformers")
+except Exception as e:
+	print("Error while importing `xformers`", e)
+
 class QKVAttentionLegacy(nn.Module):
 	"""
 	A module which performs QKV attention. Matches legacy QKVAttention + input/output heads shaping
@@ -51,13 +61,14 @@ class QKVAttentionLegacy(nn.Module):
 		super().__init__()
 		self.n_heads = n_heads
 
-	def forward(self, qkv, mask=None, rel_pos=None):
+	def forward(self, qkv, mask=None, rel_pos=None, mode="xformers"):
 		"""
 		Apply QKV attention.
 
 		:param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
 		:return: an [N x (H * C) x T] tensor after attention.
 		"""
+
 		bs, width, length = qkv.shape
 		assert width % (3 * self.n_heads) == 0
 		ch = width // (3 * self.n_heads)
@@ -73,10 +84,10 @@ class QKVAttentionLegacy(nn.Module):
 			# The proper way to do this is to mask before the softmax using -inf, but that doesn't work properly on CPUs.
 			mask = mask.repeat(self.n_heads, 1).unsqueeze(1)
 			weight = weight * mask
+			
 		a = torch.einsum("bts,bcs->bct", weight, v)
 
 		return a.reshape(bs, -1, length)
-
 
 class AttentionBlock(nn.Module):
 	"""

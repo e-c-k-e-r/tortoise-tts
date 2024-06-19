@@ -114,6 +114,9 @@ class TTS():
 		beam_width=1,
 		#mirostat_tau=0,
 		#mirostat_eta=0.1,
+
+		diffusion_sampler="ddim",
+
 		out_path=None
 	):
 		lines = text.split("\n")
@@ -222,9 +225,10 @@ class TTS():
 				precomputed_embeddings = diffusion.timestep_independent(latents, diffusion_latents, output_seq_len, False)
 
 				noise = torch.randn(output_shape, device=latents.device) * diffusion_temp
-				mel = diffuser.p_sample_loop(
+				mel = diffuser.sample_loop(
 					diffusion,
 					output_shape,
+					sampler=diffusion_sampler,
 					noise=noise,
 					model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
 					progress=True

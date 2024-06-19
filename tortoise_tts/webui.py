@@ -96,6 +96,7 @@ def do_inference( progress=gr.Progress(track_tqdm=True), *args, **kwargs ):
 	parser.add_argument("--repetition-penalty", type=float, default=kwargs["repetition-penalty"])
 	parser.add_argument("--length-penalty", type=float, default=kwargs["length-penalty"])
 	parser.add_argument("--beam-width", type=int, default=kwargs["beam-width"])
+	parser.add_argument("--diffusion-sampler", type=str, default=kwargs["diffusion-sampler"])
 	"""
 	parser.add_argument("--repetition-penalty-decay", type=float, default=kwargs["repetition-penalty-decay"])
 	parser.add_argument("--mirostat-tau", type=float, default=kwargs["mirostat-tau"])
@@ -125,6 +126,8 @@ def do_inference( progress=gr.Progress(track_tqdm=True), *args, **kwargs ):
 			#repetition_penalty_decay=args.repetition_penalty_decay,
 			length_penalty=args.length_penalty,
 			beam_width=args.beam_width,
+
+			diffusion_sampler=args.diffusion_sampler,
 		)
 	
 	wav = wav.squeeze(0).cpu().numpy()

@@ -22,6 +22,8 @@ def main():
 	parser.add_argument("--length-penalty", type=float, default=0.0)
 	parser.add_argument("--beam-width", type=int, default=0)
 	
+	parser.add_argument("--diffusion-sampler", type=str, default="ddim")
+	
 	parser.add_argument("--yaml", type=Path, default=None)
 	parser.add_argument("--device", type=str, default=None)
 	parser.add_argument("--amp", action="store_true")
@@ -56,6 +58,8 @@ def main():
 		#repetition_penalty_decay=args.repetition_penalty_decay,
 		length_penalty=args.length_penalty,
 		beam_width=args.beam_width,
+
+		diffusion_sampler=args.diffusion_sampler
 	)
 	"""
 		language=args.language,

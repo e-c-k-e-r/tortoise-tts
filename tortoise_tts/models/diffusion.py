@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from tqdm.auto import tqdm
+
 from torch import autocast
 
 from .arch_utils import normalization, AttentionBlock
@@ -493,6 +495,16 @@ class GaussianDiffusion:
 		)
 		return out
 
+	def sample_loop(self,  *args, **kwargs):
+		# YUCK
+		sampler = kwargs.pop("sampler").lower() if "sampler" in kwargs else "ddim"
+		if sampler == 'p':
+			return self.p_sample_loop(*args, **kwargs)
+		if sampler == 'ddim':
+			return self.ddim_sample_loop(*args, **kwargs)
+		
+		raise RuntimeError(f"Sampler not implemented: {sampler}")
+
 	def p_sample(
 		self,
 		model,
@@ -780,9 +792,6 @@ class GaussianDiffusion:
 		indices = list(range(self.num_timesteps))[::-1]
 
 		if progress:
-			# Lazy import so that we don't depend on tqdm.
-			from tqdm.auto import tqdm
-
 			indices = tqdm(indices, disable=not progress)
 
 		for i in indices:

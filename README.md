@@ -37,10 +37,15 @@ For training a LoRA, uncomment the `loras` block in your training YAML.
 
 - [X] Reimplement original inferencing through TorToiSe (as done with `api.py`)
   - [ ] Reimplement candidate selection with the CLVP
+  - [ ] Reimplement redaction with the Wav2Vec2
 - [X] Implement training support (without DLAS)
   - [X] Feature parity with the VALL-E training setup with preparing a dataset ahead of time
 - [ ] Automagic offloading to CPU for unused models (for training and inferencing)
 - [X] Automagic handling of the original weights into compatible weights
+- [ ] Reimplement added features from my original fork:
+  - [ ] "Better" conditioning latents calculating
+  - [x] Use of KV-cache for the AR
+  - [x] Re-enable DDIM sampler
 - [ ] Extend the original inference routine with additional features:
   - [ ] non-float32 / mixed precision for the entire stack
   - [x] BitsAndBytes support
@@ -48,10 +53,13 @@ For training a LoRA, uncomment the `loras` block in your training YAML.
   - [x] LoRAs
   - [x] Web UI
     - [ ] Feature parity with [ai-voice-cloning](https://git.ecker.tech/mrq/ai-voice-cloning)
+      - Although I feel a lot of its features are the wrong way to go about it.
   - [ ] Additional samplers for the autoregressive model
   - [ ] Additional samplers for the diffusion model
   - [ ] BigVGAN in place of the original vocoder
   - [ ] XFormers / flash_attention_2 for the autoregressive model
+    - Beyond HF's internal implementation of handling alternative attention
+    - Both the AR and diffusion models also do their own attention...
   - [ ] Some vector embedding store to find the "best" utterance to pick
 - [ ] Documentation
 
