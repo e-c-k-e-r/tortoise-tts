@@ -23,6 +23,7 @@ def main():
 	parser.add_argument("--beam-width", type=int, default=0)
 	
 	parser.add_argument("--diffusion-sampler", type=str, default="ddim")
+	parser.add_argument("--cond-free", action="store_true")
 	
 	parser.add_argument("--yaml", type=Path, default=None)
 	parser.add_argument("--device", type=str, default=None)
@@ -59,7 +60,8 @@ def main():
 		length_penalty=args.length_penalty,
 		beam_width=args.beam_width,
 
-		diffusion_sampler=args.diffusion_sampler
+		diffusion_sampler=args.diffusion_sampler,
+		cond_free=args.cond_free,
 	)
 	"""
 		language=args.language,

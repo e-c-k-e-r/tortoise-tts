@@ -117,6 +117,7 @@ class TTS():
 		#mirostat_eta=0.1,
 
 		diffusion_sampler="ddim",
+		cond_free=True,
 
 		out_path=None
 	):
@@ -129,7 +130,7 @@ class TTS():
 		diffusion = None
 		clvp = None
 		vocoder = None
-		diffuser = get_diffuser(steps=max_diffusion_steps, cond_free=False)
+		diffuser = get_diffuser(steps=max_diffusion_steps, cond_free=cond_free)
 
 		autoregressive_latents, diffusion_latents = self.encode_audio( references )["latent"]
 		
