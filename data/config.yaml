@@ -71,7 +71,7 @@ trainer:
 
   backend: deepspeed
   deepspeed:
-    inferencing: False
+    inferencing: True
     zero_optimization_level: 0
     use_compression_training: False
 
@@ -80,7 +80,7 @@ trainer:
   load_webui: False
 
 inference:
-  backend: deepspeed
+  backend: local
   normalize: False
 
   # some steps break under blanket (B)FP16 + AMP

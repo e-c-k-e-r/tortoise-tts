@@ -22,9 +22,11 @@ from .tokenizer import VoiceBpeTokenizer
 # Yuck
 from transformers import PreTrainedTokenizerFast
 
+DEFAULT_YAML = Path(__file__).parent.parent / 'data/config.yaml'
+
 @dataclass()
 class BaseConfig:
-	yaml_path: str | None = None
+	yaml_path: str | None = DEFAULT_YAML
 
 	@property
 	def cfg_path(self):
@@ -554,7 +556,7 @@ class Config(BaseConfig):
 
 	@cached_property
 	def diskcache(self):
-		if self.yaml_path is not None and self.dataset.cache:
+		if self.yaml_path is not None and self.yaml_path != DEFAULT_YAML and self.dataset.cache:
 			return diskcache.Cache(self.cache_dir).memoize
 		return lambda: lambda x: x
 

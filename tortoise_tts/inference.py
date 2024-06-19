@@ -10,7 +10,7 @@ from .emb.mel import encode_from_files as encode_mel, trim, trim_random
 from .utils import to_device
 from .utils import wrapper as ml
 
-from .config import cfg
+from .config import cfg, DEFAULT_YAML
 from .models import get_models, load_model
 from .engines import load_engines, deepspeed_available
 from .data import get_phone_symmap, tokenize
@@ -30,6 +30,9 @@ class TTS():
 		
 		self.input_sample_rate = 24000
 		self.output_sample_rate = 24000
+
+		if config is None:
+			config = DEFAULT_YAML
 
 		if config:
 			cfg.load_yaml( config )
