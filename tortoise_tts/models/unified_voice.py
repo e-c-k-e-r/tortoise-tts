@@ -12,6 +12,7 @@ from .arch_utils import AttentionBlock
 
 from transformers import LogitsWarper
 from transformers import GPT2Config, GPT2Model
+from tqdm import tqdm
 
 AVAILABLE_ATTENTIONS = ["mem_efficient", "math"]
 
@@ -216,6 +217,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 			hidden_states = hidden_states.to(self.lm_head.weight.device)
 
 		lm_logits = self.lm_head(hidden_states)
+
+		if hasattr(self, "bar"):
+			self.bar.update( 1 )
 
 		if not return_dict:
 			return (lm_logits,) + transformer_outputs[1:]
@@ -589,7 +593,7 @@ class UnifiedVoice(nn.Module):
 
 	def inference_speech(self, speech_conditioning_latent, text_inputs, input_tokens=None, num_return_sequences=1,
 						 max_generate_length=None, typical_sampling=False, typical_mass=.9, kv_cache=True, **hf_generate_kwargs):
-		seq_length = self.max_mel_tokens + self.max_text_tokens + 2
+
 		if not hasattr(self, 'inference_model'):
 			# TODO: Decouple gpt_config from this inference model.
 			self.post_init_gpt2_config(kv_cache = kv_cache)
@@ -616,9 +620,13 @@ class UnifiedVoice(nn.Module):
 
 		logits_processor = LogitsProcessorList([TypicalLogitsWarper(mass=typical_mass)]) if typical_sampling else LogitsProcessorList()
 		max_length = trunc_index + self.max_mel_tokens - 1  if max_generate_length is None else trunc_index + max_generate_length
+
+		# yucky, why doesn't the base HF GenerationMixin have a tqdm exposed
+		self.inference_model.bar = tqdm( unit="it", total=max_length, desc="AR" )
 		gen = self.inference_model.generate(inputs, bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token, eos_token_id=self.stop_mel_token,
 											max_length=max_length, logits_processor=logits_processor,
 											num_return_sequences=num_return_sequences, **hf_generate_kwargs)
+		self.inference_model.bar.close()
 		return gen[:, trunc_index:]
 
 

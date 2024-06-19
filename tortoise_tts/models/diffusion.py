@@ -626,7 +626,7 @@ class GaussianDiffusion:
 			img = torch.randn(*shape, device=device)
 		indices = list(range(self.num_timesteps))[::-1]
 
-		for i in tqdm(indices, disable=not progress):
+		for i in tqdm(indices, disable=not progress, desc="Diffusion"):
 			t = torch.tensor([i] * shape[0], device=device)
 			with torch.no_grad():
 				out = self.p_sample(
@@ -791,10 +791,7 @@ class GaussianDiffusion:
 			img = torch.randn(*shape, device=device)
 		indices = list(range(self.num_timesteps))[::-1]
 
-		if progress:
-			indices = tqdm(indices, disable=not progress)
-
-		for i in indices:
+		for i in tqdm(indices, disable=not progress, desc="Diffusion"):
 			t = torch.tensor([i] * shape[0], device=device)
 			with torch.no_grad():
 				out = self.ddim_sample(

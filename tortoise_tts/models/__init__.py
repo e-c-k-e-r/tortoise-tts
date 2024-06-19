@@ -69,6 +69,7 @@ def download_model( save_path, chunkSize = 1024, unit = "MiB" ):
 			
 			bar.update( len(chunk) / scale )
 			f.write(chunk)
+		bar.close()
 
 # semi-necessary as a way to provide a mechanism for other portions of the program to access models
 @cache
