@@ -40,7 +40,7 @@ For training a LoRA, uncomment the `loras` block in your training YAML.
   - [ ] Reimplement redaction with the Wav2Vec2
 - [X] Implement training support (without DLAS)
   - [X] Feature parity with the VALL-E training setup with preparing a dataset ahead of time
-- [ ] Automagic offloading to CPU for unused models (for training and inferencing)
+- [X] Automagic offloading to CPU for unused models (for training and inferencing)
 - [X] Automagic handling of the original weights into compatible weights
 - [ ] Reimplement added features from my original fork:
   - [ ] "Better" conditioning latents calculating

@@ -229,6 +229,10 @@ def run_eval(engines, eval_name, dl):
 	else:
 		_logger.info(f"Validation Metrics: {json.dumps(engines_stats)}.")
 
+	diffusion = diffusion.to("cpu")
+	clvp = clvp.to("cpu")
+	vocoder = vocoder.to("cpu")
+
 
 def train():
 	parser = argparse.ArgumentParser("TorToiSe TTS")

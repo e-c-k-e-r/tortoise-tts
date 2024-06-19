@@ -21,8 +21,6 @@ from .tokenizer import VoiceBpeTokenizer
 
 # Yuck
 from transformers import PreTrainedTokenizerFast
-from tokenizers import Tokenizer
-
 
 @dataclass()
 class BaseConfig:
@@ -472,16 +470,9 @@ class Inference:
 	weight_dtype: str = "float32"
 	amp: bool = False
 
+	auto_unload: bool = True
+
 	normalize: bool = False # do NOT enable this unless you know exactly what you're doing
-
-	# legacy / backwards compat
-	use_vocos: bool = True
-	use_encodec: bool = True
-	use_dac: bool = True
-
-	# shit that doesn't work
-	recurrent_chunk_size: int = 0
-	recurrent_forward: bool = False
 
 	@cached_property
 	def dtype(self):

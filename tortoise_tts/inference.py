@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .emb.mel import encode_from_files as encode_mel, trim, trim_random
 from .utils import to_device
+from .utils import wrapper as ml
 
 from .config import cfg
 from .models import get_models, load_model
@@ -110,7 +111,7 @@ class TTS():
 		top_k=0,
 		repetition_penalty=1.0,
 		#repetition_penalty_decay=0.0,
-		length_penalty=0.0,
+		length_penalty=1.0,
 		beam_width=1,
 		#mirostat_tau=0,
 		#mirostat_eta=0.1,
@@ -151,6 +152,13 @@ class TTS():
 		if vocoder is None:
 			vocoder = load_model("vocoder", device=cfg.device)
 
+		# shove everything to cpu
+		if cfg.inference.auto_unload:
+			autoregressive = autoregressive.to("cpu")
+			diffusion = diffusion.to("cpu")
+			clvp = clvp.to("cpu")
+			vocoder = vocoder.to("cpu")
+
 		wavs = []
 		# other vars
 		calm_token = 832
@@ -168,79 +176,82 @@ class TTS():
 			text_lengths = torch.Tensor([ text.shape[0] ]).to(dtype=torch.int32)
 
 			with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
-				# autoregressive pass
-				codes = autoregressive.inference_speech(
-					autoregressive_latents,
-					text_tokens,
-					do_sample=True,
-					top_p=top_p,
-					temperature=ar_temp,
-					num_return_sequences=1,
-					length_penalty=length_penalty,
-					repetition_penalty=repetition_penalty,
-					max_generate_length=max_ar_steps,
-				)
-				
-				"""
-				padding_needed = max_ar_steps - codes.shape[1]
-				codes = F.pad(codes, (0, padding_needed), value=autoregressive.stop_mel_token)
-				"""
+				with ml.auto_unload(autoregressive, enabled=cfg.inference.auto_unload):
+					# autoregressive pass
+					codes = autoregressive.inference_speech(
+						autoregressive_latents,
+						text_tokens,
+						do_sample=True,
+						top_p=top_p,
+						temperature=ar_temp,
+						num_return_sequences=1,
+						length_penalty=length_penalty,
+						repetition_penalty=repetition_penalty,
+						max_generate_length=max_ar_steps,
+					)
 
-				for i, code in enumerate( codes ):
-					stop_token_indices = (codes[i] == autoregressive.stop_mel_token).nonzero()
-					stm = stop_token_indices.min().item()
+					"""
+					padding_needed = max_ar_steps - codes.shape[1]
+					codes = F.pad(codes, (0, padding_needed), value=autoregressive.stop_mel_token)
+					"""
 
-					if len(stop_token_indices) == 0:
-						continue
+					for i, code in enumerate( codes ):
+						stop_token_indices = (codes[i] == autoregressive.stop_mel_token).nonzero()
+						stm = stop_token_indices.min().item()
 
-					codes[i][stop_token_indices] = 83
-					codes[i][stm:] = 83
+						if len(stop_token_indices) == 0:
+							continue
 
-					if stm - 3 < codes[i].shape[0]:
-						codes[i][-3] = 45
-						codes[i][-2] = 45
-						codes[i][-1] = 248
+						codes[i][stop_token_indices] = 83
+						codes[i][stm:] = 83
 
-				wav_lengths = torch.tensor([codes.shape[-1] * autoregressive.mel_length_compression], device=text_tokens.device)
+						if stm - 3 < codes[i].shape[0]:
+							codes[i][-3] = 45
+							codes[i][-2] = 45
+							codes[i][-1] = 248
 
-				latents = autoregressive.forward(
-					autoregressive_latents,
-					text_tokens,
-					text_lengths,
-					codes,
-					wav_lengths,
-					return_latent=True,
-					clip_inputs=False
-				)
+					wav_lengths = torch.tensor([codes.shape[-1] * autoregressive.mel_length_compression], device=text_tokens.device)
 
-				calm_tokens = 0
-				for k in range( codes.shape[-1] ):
-					if codes[0, k] == calm_token:
-						calm_tokens += 1
-					else:
-						calm_tokens = 0
-					if calm_tokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
-						latents = latents[:, :k]
-						break
+					latents = autoregressive.forward(
+						autoregressive_latents,
+						text_tokens,
+						text_lengths,
+						codes,
+						wav_lengths,
+						return_latent=True,
+						clip_inputs=False
+					)
+
+					calm_tokens = 0
+					for k in range( codes.shape[-1] ):
+						if codes[0, k] == calm_token:
+							calm_tokens += 1
+						else:
+							calm_tokens = 0
+						if calm_tokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
+							latents = latents[:, :k]
+							break
 
 				# diffusion pass
-				output_seq_len = latents.shape[1] * 4 * 24000 // 22050  # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
-				output_shape = (latents.shape[0], 100, output_seq_len)
-				precomputed_embeddings = diffusion.timestep_independent(latents, diffusion_latents, output_seq_len, False)
+				with ml.auto_unload(diffusion, enabled=cfg.inference.auto_unload):
+					output_seq_len = latents.shape[1] * 4 * 24000 // 22050  # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
+					output_shape = (latents.shape[0], 100, output_seq_len)
+					precomputed_embeddings = diffusion.timestep_independent(latents, diffusion_latents, output_seq_len, False)
 
-				noise = torch.randn(output_shape, device=latents.device) * diffusion_temp
-				mel = diffuser.sample_loop(
-					diffusion,
-					output_shape,
-					sampler=diffusion_sampler,
-					noise=noise,
-					model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
-					progress=True
-				)
-				mels = denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
+					noise = torch.randn(output_shape, device=latents.device) * diffusion_temp
+					mel = diffuser.sample_loop(
+						diffusion,
+						output_shape,
+						sampler=diffusion_sampler,
+						noise=noise,
+						model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
+						progress=True
+					)
+					mels = denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
 
 				# vocoder pass
-				waves = vocoder.inference(mels)
+				with ml.auto_unload(vocoder, enabled=cfg.inference.auto_unload):
+					waves = vocoder.inference(mels)
 
 				for wav in waves:
 					if out_path is not None:

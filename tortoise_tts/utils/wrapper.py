@@ -77,6 +77,14 @@ def autocasts(input, from_dtype, to_dtype):
 	else:
 		yield input
 
+@contextmanager
+def auto_unload( model, gpu="cuda", cpu="cpu", enabled=True):
+	model.to(gpu)
+	yield model
+	
+	if enabled:
+		model.to(cpu)
+
 # handles temporarily upcasting 'index tensors' so torch will stop bitching
 def autocast_forward( func ):
 	def wrapper( self, input, *args, **kwargs ):
