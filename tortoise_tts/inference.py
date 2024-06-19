@@ -180,18 +180,22 @@ class TTS():
 					repetition_penalty=repetition_penalty,
 					max_generate_length=max_ar_steps,
 				)
+				
+				"""
 				padding_needed = max_ar_steps - codes.shape[1]
 				codes = F.pad(codes, (0, padding_needed), value=autoregressive.stop_mel_token)
+				"""
 
 				for i, code in enumerate( codes ):
 					stop_token_indices = (codes[i] == autoregressive.stop_mel_token).nonzero()
+					stm = stop_token_indices.min().item()
 
 					if len(stop_token_indices) == 0:
 						continue
 
 					codes[i][stop_token_indices] = 83
-					stm = stop_token_indices.min().item()
 					codes[i][stm:] = 83
+
 					if stm - 3 < codes[i].shape[0]:
 						codes[i][-3] = 45
 						codes[i][-2] = 45
