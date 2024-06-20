@@ -1,6 +1,7 @@
 import torch
 import torchaudio
 import soundfile
+import time
 
 from torch import Tensor
 from einops import rearrange
@@ -8,8 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .emb.mel import encode_from_files as encode_mel, trim, trim_random
-from .utils import to_device
-from .utils import wrapper as ml
+from .utils import to_device, set_seed, wrapper as ml
 
 from .config import cfg, DEFAULT_YAML
 from .models import get_models, load_model
@@ -140,6 +140,8 @@ class TTS():
 
 		vocoder_type="bigvgan",
 
+		seed=None,
+
 		out_path=None,
 	):
 		lines = text.split("\n")
@@ -189,12 +191,14 @@ class TTS():
 
 		candidates = 1
 
+		set_seed(seed)
+
 		for line in lines:
 			if out_path is None:
 				output_dir = Path("./data/results/")
 				if not output_dir.exists():
 					output_dir.mkdir(parents=True, exist_ok=True)
-				out_path = output_dir / f"{cfg.start_time}.wav"
+				out_path = output_dir / f"{time.time()}.wav"
 
 			text = self.encode_text( line ).to(device=cfg.device)
 

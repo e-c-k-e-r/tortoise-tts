@@ -25,6 +25,8 @@ def main():
 	parser.add_argument("--diffusion-sampler", type=str, default="ddim")
 	parser.add_argument("--cond-free", action="store_true")
 	parser.add_argument("--vocoder", type=str, default="bigvgan")
+
+	parser.add_argument("--seed", type=int, default=None)
 	
 	parser.add_argument("--yaml", type=Path, default=None)
 	parser.add_argument("--device", type=str, default=None)
@@ -65,6 +67,8 @@ def main():
 		cond_free=args.cond_free,
 		
 		vocoder_type=args.vocoder,
+		
+		seed=args.seed,
 	)
 	"""
 		language=args.language,

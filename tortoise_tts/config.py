@@ -8,9 +8,11 @@ import sys
 import time
 import argparse
 import yaml
+import random
 
 import torch
 
+import numpy as np
 from dataclasses import asdict, dataclass, field
 
 from functools import cached_property
@@ -21,6 +23,14 @@ from .tokenizer import VoiceBpeTokenizer
 
 # Yuck
 from transformers import PreTrainedTokenizerFast
+
+def set_seed(seed=None):
+	if not seed:
+		seed = time.time()
+
+	random.seed(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
 
 DEFAULT_YAML = Path(__file__).parent.parent / 'data/config.yaml'
 

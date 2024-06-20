@@ -33,6 +33,17 @@ To start the trainer, run `python3 -m tortoise_tts.train --yaml="./path/to/your/
 
 For training a LoRA, uncomment the `loras` block in your training YAML.
 
+For loading an existing finetuned model, create a folder with this structure, and load its accompanying YAML:
+```
+./some/arbitrary/path/:
+    ckpt:
+        autoregressive:
+            fp32.pth # finetuned weights
+    config.yaml
+```
+
+For LoRAs, replace the above `fp32.pth` with `lora.pth`.
+
 ## To-Do
 
 - [X] Reimplement original inferencing through TorToiSe (as done with `api.py`)
@@ -54,12 +65,14 @@ For training a LoRA, uncomment the `loras` block in your training YAML.
   - [x] Web UI
     - [ ] Feature parity with [ai-voice-cloning](https://git.ecker.tech/mrq/ai-voice-cloning)
       - Although I feel a lot of its features are the wrong way to go about it.
-  - [ ] Additional samplers for the autoregressive model
-  - [ ] Additional samplers for the diffusion model
-  - [ ] BigVGAN in place of the original vocoder
+  - [ ] Additional samplers for the autoregressive model (such as mirostat / dynamic temperature)
+  - [ ] Additional samplers for the diffusion model (beyond the already included DDIM)
+  - [X] BigVGAN in place of the original vocoder
+    - [X] HiFiGAN integration as well
   - [ ] XFormers / flash_attention_2 for the autoregressive model
     - Beyond HF's internal implementation of handling alternative attention
     - Both the AR and diffusion models also do their own attention...
+  - [ ] Saner way of loading finetuned models / LoRAs
   - [ ] Some vector embedding store to find the "best" utterance to pick
 - [ ] Documentation
 
