@@ -187,7 +187,7 @@ class TTS():
 
 		wavs = []
 		# other vars
-		calm_token = 832
+		calm_token = 83
 
 		candidates = 1
 
