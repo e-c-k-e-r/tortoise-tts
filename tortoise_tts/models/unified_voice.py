@@ -1,3 +1,5 @@
+# Adapted from https://github.com/neonbjb/tortoise-tts/tree/98a891e66e7a1f11a830f31bd1ce06cc1f6a88af/tortoise/models/unified_voice.py
+
 import functools
 
 import torch
@@ -13,6 +15,8 @@ from .arch_utils import AttentionBlock
 from transformers import LogitsWarper
 from transformers import GPT2Config, GPT2Model
 from tqdm import tqdm
+
+from .stream_generator import NewGenerationMixin
 
 AVAILABLE_ATTENTIONS = ["mem_efficient", "math"]
 
@@ -83,12 +87,14 @@ class ResBlock(nn.Module):
 	def forward(self, x):
 		return F.relu(self.net(x) + x)
 
-class GPT2InferenceModel(GPT2PreTrainedModel):
+class GPT2InferenceModel(GPT2PreTrainedModel, NewGenerationMixin):
 	def __init__(self, config, gpt, text_pos_emb, embeddings, norm, linear, kv_cache=True):
-		super().__init__(config)
+		super(NewGenerationMixin, self).__init__()
+		super(GPT2PreTrainedModel, self).__init__(config)
 		self.transformer = gpt
 		self.text_pos_embedding = text_pos_emb
 		self.embeddings = embeddings
+		self.final_norm = norm
 		self.lm_head = nn.Sequential(norm, linear)
 
 		self.kv_cache = kv_cache
@@ -129,14 +135,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 	def store_mel_emb(self, mel_emb):
 		self.cached_mel_emb = mel_emb
 
-	def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
+	def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
 		token_type_ids = kwargs.get("token_type_ids", None)
 
 		if not self.kv_cache:
-			past = None
+			past_key_values = None
 
 		# only last token for inputs_ids if past is defined in kwargs
-		if past:
+		if past_key_values:
 			input_ids = input_ids[:, -1].unsqueeze(-1)
 			if token_type_ids is not None:
 				token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
@@ -148,13 +154,13 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 			# create position_ids on the fly for batch generation
 			position_ids = attention_mask.long().cumsum(-1) - 1
 			position_ids.masked_fill_(attention_mask == 0, 1)
-			if past:
+			if past_key_values:
 				position_ids = position_ids[:, -1].unsqueeze(-1)
 		else:
 			position_ids = None
 		return {
 			"input_ids": input_ids,
-			"past_key_values": past,
+			"past_key_values": past_key_values,
 			"use_cache": kwargs.get("use_cache"),
 			"position_ids": position_ids,
 			"attention_mask": attention_mask,
@@ -597,6 +603,24 @@ class UnifiedVoice(nn.Module):
 
 		return loss_text.mean(), loss_mel.mean(), mel_logits
 
+	def compute_embeddings( self, cond_latents, text_inputs, kv_cache = True ):
+		text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
+		text_inputs = F.pad(text_inputs, (1, 0), value=self.start_text_token)
+		emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+		conds = cond_latents.unsqueeze(1)
+		emb = torch.cat([conds, emb], dim=1)
+		
+		if not hasattr(self, 'inference_model'):
+			# TODO: Decouple gpt_config from this inference model.
+			self.post_init_gpt2_config(kv_cache = kv_cache)
+
+		self.inference_model.store_mel_emb(emb)
+
+		embs = torch.full( ( emb.shape[0], emb.shape[1] + 1 ), fill_value=1, dtype=torch.long, device=text_inputs.device )
+		embs[:, -1] = self.start_mel_token
+		
+		return embs
+
 	def inference_speech(self, speech_conditioning_latent, text_inputs, input_tokens=None, num_return_sequences=1,
 						 max_generate_length=None, typical_sampling=False, typical_mass=.9, kv_cache=True, **hf_generate_kwargs):
 
@@ -634,6 +658,17 @@ class UnifiedVoice(nn.Module):
 											num_return_sequences=num_return_sequences, **hf_generate_kwargs)
 		self.inference_model.bar.close()
 		return gen[:, trunc_index:]
+
+	def get_generator(self, inputs, max_length=500, **hf_generate_kwargs):
+		return self.inference_model.generate(
+			inputs,
+			bos_token_id=self.start_mel_token,
+			pad_token_id=self.stop_mel_token,
+			eos_token_id=self.stop_mel_token,
+			max_length=max_length,
+			do_stream=True,
+			**hf_generate_kwargs,
+		)
 
 
 if __name__ == '__main__':

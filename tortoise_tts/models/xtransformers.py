@@ -1,3 +1,5 @@
+# Copied from https://github.com/neonbjb/tortoise-tts/tree/98a891e66e7a1f11a830f31bd1ce06cc1f6a88af/tortoise/models/xtransformers.py
+
 import math
 from collections import namedtuple
 from functools import partial

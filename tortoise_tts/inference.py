@@ -5,6 +5,7 @@ import soundfile
 from torch import Tensor
 from einops import rearrange
 from pathlib import Path
+from tqdm import tqdm
 
 from .emb.mel import encode_from_files as encode_mel, trim, trim_random
 from .utils import to_device
@@ -96,6 +97,21 @@ class TTS():
 		# merge inputs
 		return encode_mel( paths, device=self.device )
 
+	# taken from here https://github.com/coqui-ai/TTS/blob/d21f15cc850788f9cdf93dac0321395138665287/TTS/tts/models/xtts.py#L666
+	def handle_chunks(self, wav_gen, wav_gen_prev, wav_overlap, overlap_len):
+		"""Handle chunk formatting in streaming mode"""
+		wav_chunk = wav_gen[:-overlap_len]
+		if wav_gen_prev is not None:
+			wav_chunk = wav_gen[(wav_gen_prev.shape[0] - overlap_len) : -overlap_len]
+		if wav_overlap is not None:
+			crossfade_wav = wav_chunk[:overlap_len]
+			crossfade_wav = crossfade_wav * torch.linspace(0.0, 1.0, overlap_len).to(crossfade_wav.device)
+			wav_chunk[:overlap_len] = wav_overlap * torch.linspace(1.0, 0.0, overlap_len).to(wav_overlap.device)
+			wav_chunk[:overlap_len] += crossfade_wav
+		wav_overlap = wav_gen[-overlap_len:]
+		wav_gen_prev = wav_gen
+		return wav_chunk, wav_gen_prev, wav_overlap
+
 	@torch.inference_mode()
 	def inference(
 		self,
@@ -122,7 +138,9 @@ class TTS():
 		diffusion_sampler="ddim",
 		cond_free=True,
 
-		out_path=None
+		vocoder_type="bigvgan",
+
+		out_path=None,
 	):
 		lines = text.split("\n")
 
@@ -142,7 +160,7 @@ class TTS():
 				diffusion = engine.module
 			elif "clvp" in name:
 				clvp = engine.module
-			elif "vocoder" in name:
+			elif vocoder_type in name:
 				vocoder = engine.module
 
 		if autoregressive is None:
@@ -152,7 +170,7 @@ class TTS():
 		if clvp is None:
 			clvp = load_model("clvp", device=cfg.device)
 		if vocoder is None:
-			vocoder = load_model("vocoder", device=cfg.device)
+			vocoder = load_model(vocoder_type, device=cfg.device)
 		
 		autoregressive = autoregressive.to(cfg.device)
 		diffusion = diffusion.to(cfg.device)
@@ -183,6 +201,88 @@ class TTS():
 			text_tokens = pad_sequence([ text ], batch_first = True)
 			text_lengths = torch.Tensor([ text.shape[0] ]).to(dtype=torch.int32)
 
+			# streaming interface spits out the final hidden state, which HiFiGAN seems to be trained against
+			if vocoder_type == "hifigan":
+				waves = []
+				all_latents = []
+				all_codes = []
+
+				wav_gen_prev = None
+				wav_overlap = None
+				is_end = False
+				first_buffer = 60
+
+				stream_chunk_size = 40
+				overlap_wav_len = 1024
+
+				with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
+					with ml.auto_unload(autoregressive, enabled=cfg.inference.auto_unload):
+						with ml.auto_unload(vocoder, enabled=cfg.inference.auto_unload):
+							inputs = autoregressive.compute_embeddings( autoregressive_latents, text_tokens )
+
+							gpt_generator = autoregressive.get_generator(
+								inputs=inputs,
+								top_k=top_k,
+								top_p=top_p,
+								temperature=ar_temp,
+								do_sample=True,
+								num_beams=max(1, beam_width),
+								num_return_sequences=1,
+								length_penalty=length_penalty,
+								repetition_penalty=repetition_penalty,
+								output_attentions=False,
+								output_hidden_states=True,
+							)
+
+							bar = tqdm( unit="it", total=500 )
+							while not is_end:
+								try:
+									codes, latent = next(gpt_generator)
+									all_latents += [latent]
+									all_codes += [codes]
+								except StopIteration:
+									is_end = True
+
+								if is_end or (stream_chunk_size > 0 and len(all_codes) >= max(stream_chunk_size, first_buffer)):
+									first_buffer = 0
+									all_codes = []
+									bar.update( stream_chunk_size )
+
+									latents = torch.cat(all_latents, dim=0)[None, :].to(cfg.device)
+									wav_gen = vocoder.inference(latents, autoregressive_latents)
+									wav_gen = wav_gen.squeeze()
+
+									wav_chunk = wav_gen[:-overlap_wav_len]
+									if wav_gen_prev is not None:
+										wav_chunk = wav_gen[(wav_gen_prev.shape[0] - overlap_wav_len) : -overlap_wav_len]
+									if wav_overlap is not None:
+										crossfade_wav = wav_chunk[:overlap_wav_len]
+										crossfade_wav = crossfade_wav * torch.linspace(0.0, 1.0, overlap_wav_len).to(crossfade_wav.device)
+										wav_chunk[:overlap_wav_len] = wav_overlap * torch.linspace(1.0, 0.0, overlap_wav_len).to(wav_overlap.device)
+										wav_chunk[:overlap_wav_len] += crossfade_wav
+									
+									wav_overlap = wav_gen[-overlap_wav_len:]
+									wav_gen_prev = wav_gen
+									
+
+									# yielding requires to do a bunch of pain to work around it turning into an async function
+									"""
+									yield wav_chunk
+									"""
+
+									waves.append( wav_chunk.unsqueeze(0) )
+
+							bar.close()
+
+				wav = torch.concat(waves, dim=-1)
+
+				if out_path is not None:
+					torchaudio.save( out_path, wav.cpu(), sr )
+
+				wavs.append(wav)
+
+				continue
+
 			with torch.autocast("cuda", dtype=cfg.inference.dtype, enabled=cfg.inference.amp):
 				with ml.auto_unload(autoregressive, enabled=cfg.inference.auto_unload):
 					# autoregressive pass
@@ -190,9 +290,11 @@ class TTS():
 						autoregressive_latents,
 						text_tokens,
 						do_sample=True,
+						top_k=top_k,
 						top_p=top_p,
 						temperature=ar_temp,
 						num_return_sequences=candidates,
+						num_beams=max(1,beam_width),
 						length_penalty=length_penalty,
 						repetition_penalty=repetition_penalty,
 						max_generate_length=max_ar_steps,

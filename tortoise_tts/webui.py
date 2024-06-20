@@ -95,6 +95,7 @@ def do_inference( progress=gr.Progress(track_tqdm=True), *args, **kwargs ):
 	parser.add_argument("--beam-width", type=int, default=kwargs["beam-width"])
 	parser.add_argument("--diffusion-sampler", type=str, default=kwargs["diffusion-sampler"])
 	parser.add_argument("--cond-free", type=str, default=kwargs["cond-free"])
+	parser.add_argument("--vocoder", type=str, default=kwargs["vocoder"].lower())
 	"""
 	parser.add_argument("--repetition-penalty-decay", type=float, default=kwargs["repetition-penalty-decay"])
 	parser.add_argument("--mirostat-tau", type=float, default=kwargs["mirostat-tau"])
@@ -126,6 +127,7 @@ def do_inference( progress=gr.Progress(track_tqdm=True), *args, **kwargs ):
 			beam_width=args.beam_width,
 
 			diffusion_sampler=args.diffusion_sampler,
+			vocoder_type=args.vocoder,
 		)
 	
 	wav = wav.squeeze(0).cpu().numpy()
@@ -210,7 +212,7 @@ with ui:
 			with gr.Column(scale=1):
 				layout["inference"]["inputs"]["reference"] = gr.Audio(label="Audio Input", sources=["upload"], type="filepath") #, info="Reference audio for TTS")
 				# layout["inference"]["stop"] = gr.Button(value="Stop")
-				layout["inference"]["outputs"]["output"] = gr.Audio(label="Output")
+				layout["inference"]["outputs"]["output"] = gr.Audio(label="Output", streaming=True)
 				layout["inference"]["buttons"]["inference"] = gr.Button(value="Inference")
 			with gr.Column(scale=7):
 				with gr.Row():
@@ -221,6 +223,7 @@ with ui:
 				with gr.Row():
 					layout["inference"]["inputs"]["ar-temp"] = gr.Slider(value=0.8, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (AR)", info="Modifies the randomness from the samples in the AR. (0 to greedy sample)")
 					layout["inference"]["inputs"]["diffusion-temp"] = gr.Slider(value=1.0, minimum=0.0, maximum=1.5, step=0.05, label="Temperature (Diffusion)", info="Modifies the initial noise during the diffusion pass.")
+					layout["inference"]["inputs"]["vocoder"] = gr.Radio( ["Vocoder", "BigVGAN", "HiFiGAN"], value="BigVGAN", label="Vocoder", type="value", info="Vocoder to use for generating the final waveform (HiFiGAN skips diffusion)." )
 				"""
 				with gr.Row():
 					layout["inference"]["inputs"]["dynamic-sampling"] = gr.Checkbox(label="Dynamic Temperature", info="Dynamically adjusts the temperature based on the highest confident predicted token per sampling step.")

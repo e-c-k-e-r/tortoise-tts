@@ -1,3 +1,5 @@
+vocoder: "hifigan"
+
 models:
 - name: "autoregressive"
   training: True
@@ -71,7 +73,7 @@ trainer:
 
   backend: deepspeed
   deepspeed:
-    inferencing: True
+    inferencing: False
     zero_optimization_level: 0
     use_compression_training: False
 

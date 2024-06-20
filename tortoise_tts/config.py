@@ -526,6 +526,8 @@ class Config(BaseConfig):
 	sample_rate: int = 24_000
 	audio_backend: str = "mel"
 
+	vocoder: str = "bigvgan" # "vocoder" | "bigvgan" | "hifigan"
+
 	@property
 	def model(self):
 		for i, model in enumerate(self.models):
