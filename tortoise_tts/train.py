@@ -42,7 +42,7 @@ def train_feeder(engine, batch):
 
 		text_tokens = pad_sequence([ text for text in batch["text"] ], batch_first = True)
 		text_lengths = torch.Tensor([ text.shape[0] for text in batch["text"] ]).to(dtype=torch.int32)
-		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = stop_mel_token )
+		mel_codes = pad_sequence([ codes[0] for codes in batch["mel"] ], batch_first = True, padding_value = engine.module.stop_mel_token )
 		wav_lengths = torch.Tensor([ x for x in batch["wav_length"] ]).to(dtype=torch.int32)
 
 		engine.forward(autoregressive_latents, text_tokens, text_lengths, mel_codes, wav_lengths)
