@@ -163,6 +163,8 @@ class Dataset:
 
 	sample_type: str = "path" # path | speaker
 	sample_order: str = "shuffle" # duration
+	sample_max_duration_batch: float = 0.0 # total number of seconds of utterances per batched, 0 to disable
+
 
 	tasks_list: list[str] = field(default_factory=lambda: ["tts"])
 	
