@@ -47,6 +47,7 @@ def train_feeder(engine, batch):
 
 		engine.forward(autoregressive_latents, text_tokens, text_lengths, mel_codes, wav_lengths)
 
+		engine.current_batch_size = batch_size
 		losses = engine.gather_attribute("loss")
 		stat = engine.gather_attribute("stats")
 

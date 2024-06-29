@@ -71,6 +71,7 @@ class Engine():
 		self.max_nan_losses = 8
 		self.loss_scaler = torch.cuda.amp.GradScaler() if cfg.trainer.scale_loss else None
 
+		self.current_batch_size = 0
 		self._global_grad_norm = None
 
 	def freeze(self, freeze_all=True):
@@ -108,7 +109,7 @@ class Engine():
 
 	@property
 	def batch_size(self):
-		return cfg.hyperparameters.batch_size
+		return self.current_batch_size if self.current_batch_size > 0 else cfg.hyperparameters.batch_size
 
 	@property
 	def gradient_accumulation_steps(self):
