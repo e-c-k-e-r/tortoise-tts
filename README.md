@@ -59,6 +59,7 @@ For LoRAs, replace the above `fp32.pth` with `lora.pth`.
   - [x] Re-enable DDIM sampler
 - [ ] Extend the original inference routine with additional features:
   - [ ] non-float32 / mixed precision for the entire stack
+    - Parts of the stack will whine about mismatching dtypes...
   - [x] BitsAndBytes support
     - Provided Linears technically aren't used because GPT2 uses Conv1D instead...
   - [x] LoRAs
@@ -75,12 +76,16 @@ For LoRAs, replace the above `fp32.pth` with `lora.pth`.
   - [ ] Saner way of loading finetuned models / LoRAs
   - [ ] Some vector embedding store to find the "best" utterance to pick
 - [ ] Documentation
+  - this also includes a correct explanation of the entire stack (rather than the poor one I left in ai-voice-cloning)
 
 ## Why?
 
-To correct the mess I've made with forking TorToiSe TTS originally with a bunch of slopcode, and the nightmare that ai-voice-cloning turned out.
-
-Additional features can be applied to the program through a framework of my own that I'm very familiar with.
+To:
+* atone for the mess I've made with forking TorToiSe TTS originally with a bunch of slopcode, and the nightmare that ai-voice-cloning turned out.
+* unify the trainer and the inference-er.
+* implement additional features with much ease, as I'm very well familiar with my framework.
+* disillusion myself that it won't get better than TorToiSe TTS:
+  - while it's faster than VALL-E, the quality leaves a lot to be desired (although this is simply due to the overall architecture).
 
 ## License
 
