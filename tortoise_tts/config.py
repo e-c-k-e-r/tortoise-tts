@@ -218,6 +218,7 @@ class LoRA:
 	rank: int = 8 # rank for the LoRA
 	alpha: int = 16 # rank for the LoRA
 	training: bool = True # 
+	embeddings: bool = False
 	parametrize: bool = False # 
 	module: str = "linear" # linear | conv1d
 

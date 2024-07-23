@@ -1,5 +1,4 @@
 # Adapted from https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
-
 from functools import partial
 import torch
 import torch.nn.functional as F
@@ -148,6 +147,7 @@ class ParameterizedLoRA(nn.Module):
 def passes_policy( policy, name ):
 	if policy is None:
 		return True
+
 	if "exclude" in policy:
 		for term in policy["exclude"]:
 			if term in name:
@@ -192,7 +192,7 @@ def apply_lora( model, register = True, merge = False, policy = None, use_parame
 		else:
 			setattr( model.get_submodule(name), k, replacement )
 
-	return model
+	return enable_lora( model )
 
 def enable_lora( model, mode = True ):
 	for name, module in model.named_modules():
@@ -204,10 +204,18 @@ def enable_lora( model, mode = True ):
 def disable_lora( model ):
 	return enable_lora( model, False )
 
-def freeze_non_lora_weights( model ):
+def freeze_non_lora_weights( model, embeddings = False ):
+	frozen_params = []
+
 	for name, param in model.named_parameters():
-		param.requires_grad_('lora_' in name)
-	return model
+		should = 'lora_' in name or (embeddings and "_emb" in name)
+
+		param.requires_grad_(should)
+		
+		if not should:
+			frozen_params.append( param )
+
+	return frozen_params
 
 def lora_get_state_dict( state_dict, split = True ):
 	lora = { name: param for name, param in state_dict.items() if "lora_" in name }

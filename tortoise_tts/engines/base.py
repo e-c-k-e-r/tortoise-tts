@@ -81,7 +81,7 @@ class Engine():
 
 		# freeze non-LoRA params if requested
 		if not self.hyper_config.frozen_params and not freeze_all and cfg.lora is not None:
-			return freeze_non_lora_weights( self.module )
+			return freeze_non_lora_weights( self.module, embeddings=cfg.lora.embeddings )
 
 		for name, param in self.module.named_parameters():
 			if (freeze_all and param.requires_grad) or (not freeze_all and name in self.hyper_config.frozen_params):
@@ -164,15 +164,19 @@ class Engine():
 
 		if tag is None:
 			tag_path = load_dir / "latest"
+
 			if not tag_path.exists():
 				return
+
 			tag = open(tag_path).read()
 
 		load_path = load_dir / tag / "state.pth"
+
 		if not load_path.exists():
 			return
 
 		state = torch.load(load_path, map_location=torch.device(cfg.device))
+
 		self.global_steps = state['stats']['global_step'] if 'stats' in state else state['global_step']
 		self.micro_steps = state['stats']['micro_step'] if 'stats' in state else state['micro_step']
 		self.global_samples = state['stats']['global_samples'] if 'stats' in state else state['global_samples']
@@ -320,11 +324,21 @@ class Engines(dict[str, Engine]):
 		for engine in self.values():
 			engine.dispatch_attribute(*args, **kwargs)
 
-	def export(self, userdata={}, callback=None):
+	def export(self, userdata={}, callback=None, dtype=None):
+		if dtype is None:
+			dtype = cfg.trainer.dtype
+
 		for name, engine in self.items():
 			module = engine.module.state_dict()
 			lora = None
 			save_path = cfg.ckpt_dir / name / "fp32.pth"
+			config = engine.module.config if hasattr(engine.module, "config") else engine.hyper_config
+			if not isinstance(config, dict):
+				config = config.__dict__
+
+			# safety
+			for k, v in module.items():
+				module[k] = v.to(dtype)
 
 			if cfg.lora is not None:				
 				lora, module = lora_get_state_dict( module, split = True )
@@ -339,8 +353,13 @@ class Engines(dict[str, Engine]):
 					"global_samples": engine.global_samples,
 					"tokens_processed": engine.tokens_processed,
 				},
-				"userdata": userdata
+				"userdata": userdata,
+				"config": config
 			}
+
+			if lora is None:
+				del state_dict['lora']
+
 			if callback:
 				state_dict = callback( state_dict, config = engine.hyper_config, save_path = save_path )
 
@@ -378,18 +397,19 @@ class Engines(dict[str, Engine]):
 						p.unlink()
 					d.rmdir()
 
-	def load_checkpoint(self, tag=None):
+	def load_checkpoint(self, tag=None, training=True):
 		if not tag:
 			tag = cfg.trainer.load_tag
 
 		for name, engine in self.items():
 			load_dir = cfg.ckpt_dir / name
+
 			engine.load_checkpoint(
 				tag=tag,
 				load_dir=load_dir,
 				load_module_strict=cfg.trainer.strict_loading,
-				load_optimizer_states=False if cfg.trainer.load_module_only else cfg.trainer.load_states,
-				load_lr_scheduler_states=False if cfg.trainer.load_module_only else cfg.trainer.load_states,
+				load_optimizer_states=False if cfg.trainer.load_module_only or not training else cfg.trainer.load_states,
+				load_lr_scheduler_states=False if cfg.trainer.load_module_only or not training else cfg.trainer.load_states,
 				load_module_only=cfg.trainer.load_module_only,
 			)
 			if cfg.trainer.restart_step_count:
