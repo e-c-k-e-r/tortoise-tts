@@ -97,7 +97,7 @@ optimizations:
   embedding: False
   optimizers: True
 
-  bitsandbytes: True
+  bitsandbytes: False
   dadaptation: False
   bitnet: False
   fp8: False

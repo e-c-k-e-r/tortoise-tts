@@ -3,6 +3,6 @@ __pycache__
 /training
 /venv
 /*.egg-info
-/vall_e/version.py
+/tortoise_tts/version.py
 /.cache
 /voices

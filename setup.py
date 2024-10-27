@@ -53,6 +53,9 @@ setup(
         # HF bloat
         "tokenizers",
         "transformers",
+        "inflect",
+        "unidecode",
+        "vector_quantize_pytorch",
 
         #
         "rotary_embedding_torch",
