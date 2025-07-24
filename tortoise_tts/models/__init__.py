@@ -46,7 +46,7 @@ DEFAULT_MODEL_URLS = {
 
 # kludge, probably better to use HF's model downloader function
 # to-do: write to a temp file then copy so downloads can be interrupted
-def download_model( save_path, chunkSize = 1024 ):
+def download_model( save_path=DEFAULT_MODEL_PATH, chunkSize = 1024 ):
 	name = save_path.name
 	url = DEFAULT_MODEL_URLS[name] if name in DEFAULT_MODEL_URLS else None
 	if url is None:
@@ -55,18 +55,36 @@ def download_model( save_path, chunkSize = 1024 ):
 	if not save_path.parent.exists():
 		save_path.parent.mkdir(parents=True, exist_ok=True)
 
-	r = requests.get(url, stream=True)
-	content_length = int(r.headers['Content-Length'] if 'Content-Length' in r.headers else r.headers['content-length'])
+	headers = {}
+	# check if modified
+	if save_path.exists():
+		headers = {"If-Modified-Since": time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(save_path.stat().st_mtime))}
+	
+	r = requests.get(url, headers=headers, stream=True)
+
+	# not modified
+	if r.status_code == 304:
+		r.close()
+		return
+
+	content_length = None
+	# ugh
+	try:
+		# to-do: validate lengths match
+		content_length = int(r.headers['Content-Length'] if 'Content-Length' in r.headers else r.headers['content-length'])
+	except Exception as e:
+		pass
 
 	with open(save_path, 'wb') as f:
 		bar = tqdm( unit='B', unit_scale=True, unit_divisor=1024, total=content_length, desc=f"Downloading: {name}" )
 		for chunk in r.iter_content(chunk_size=chunkSize): 
 			if not chunk:
 				continue
-			
-			bar.update( len(chunk) )
+			bar.update( len(chunk))
 			f.write(chunk)
 		bar.close()
+
+	r.close()
 
 # semi-necessary as a way to provide a mechanism for other portions of the program to access models
 @cache

@@ -12,7 +12,15 @@ from transformers.utils.model_parallel_utils import get_device_map, assert_devic
 
 from .arch_utils import AttentionBlock
 
-from transformers import LogitsWarper
+try:
+	from transformers import LogitsWarper
+except Exception as e:
+	class LogitsWarper:
+		def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+			raise NotImplementedError(
+				f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+			)
+
 from transformers import GPT2Config, GPT2Model
 from tqdm import tqdm
 
@@ -369,7 +377,7 @@ class UnifiedVoice(nn.Module):
 			if "flash" in AVAILABLE_ATTENTIONS:
 				attention_implementation = "flash_attention_2"
 			else:
-				attention_implementation = "mem_efficient"
+				attention_implementation = "sdpa"
 
 		self.attention_implementation = attention_implementation
 		self.number_text_tokens = number_text_tokens

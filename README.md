@@ -26,7 +26,7 @@ To inference using the included Web UI: `python3 -m tortoise_tts.webui --yaml=".
 
 Training is as simple as copying the reference YAML from `./data/config.yaml` to any training directory of your choice (for examples: `./training/` or `./training/lora-finetune/`).
 
-A pre-processed dataset is required. Refer to [the VALL-E implementation](https://github.com/e-c-k-e-r/vall-e#leverage-your-own-dataset) for more details.
+A pre-processed dataset is required. Refer to [the VALL-E implementation](https://github.com/e-c-k-e-r/vall-e/blob/11fa3da66524a8dc2456420aedae9bec6de13c9d/README.md#leverage-your-own-dataset) for more details.
 
 To start the trainer, run `python3 -m tortoise_tts.train --yaml="./path/to/your/training/config.yaml`.
 + Type `save` to save whenever. Type `quit` to quit and save whenever. Type `eval` to run evaluation / validation of the model.
@@ -46,6 +46,7 @@ For LoRAs, replace the above `fp32.pth` with `lora.pth`.
 
 ## To-Do
 
+- [ ] Re-backport all the creature comforts from VALL-E
 - [X] Reimplement original inferencing through TorToiSe (as done with `api.py`)
   - [ ] Reimplement candidate selection with the CLVP
   - [ ] Reimplement redaction with the Wav2Vec2
