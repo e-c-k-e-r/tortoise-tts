@@ -79,7 +79,7 @@ def format_diffusion_conditioning( sample, device, do_normalization=False ):
 
 # encode a wav to conditioning latents + mel codes
 @torch.inference_mode()
-def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda"):
+def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", dtype=None):
 	wav = torchaudio.functional.resample(wav, sr, 22050)
 
 	dvae = load_model("dvae", device=device)

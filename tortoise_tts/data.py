@@ -1,4 +1,4 @@
-# todo: clean this mess up
+# todo: back port this from vall-e
 
 import copy
 import h5py
@@ -63,6 +63,8 @@ def get_task_symmap():
 	}
 
 def _replace_file_extension(path, suffix):
+	if not isinstance( path, Path ):
+		path = Path(path)
 	return (path.parent / path.name.split(".")[0]).with_suffix(suffix)
 
 def _get_mel_extension():
@@ -76,6 +78,32 @@ def _get_mel_path(path):
 
 def _get_phone_path(path):
 	return _replace_file_extension(path, _get_phone_extension())
+
+def _get_artifact_extension():
+	return _get_mel_extension()
+
+def _get_metadata_extension():
+	return _get_phone_extension()
+
+def _get_artifact_path(path):
+	return _replace_file_extension(path, _get_artifact_extension())
+
+def _load_artifact(path, return_metadata=False, return_artifact=False, validate=True) -> Tensor:
+	artifact = np.load(_get_artifact_path(path), allow_pickle=True)[()]
+	codes = artifact["codes"]
+	
+	if validate and np.count_nonzero(codes) == 0:
+		raise Exception(f"Artifact contains zero'd tensor: {path}")
+
+	codes = torch.from_numpy(codes.astype(int)).to(torch.int16)
+
+	if return_artifact:
+		return codes, artifact
+
+	if return_metadata:
+		return codes, artifact["metadata"]
+
+	return codes
 
 _durations_map = {}
 # makeshift caching the above to disk
@@ -167,12 +195,7 @@ def _get_paths_of_extensions( path, extensions=_get_mel_extension(), validate=Fa
 	return [ p for p in list(path.iterdir()) if _validate(p) ] if path.exists() and path.is_dir() else []
 
 def _load_mels(path, return_metadata=False) -> Tensor:
-	mel = np.load(_get_mel_path(path), allow_pickle=True)[()]
-	if return_metadata:
-		mel["metadata"]["text"] = mel["text"]
-
-		return mel["codes"].to(torch.int16), mel["metadata"]
-	return mel["codes"].to(torch.int16)
+	return _load_artifact(path, return_metadata)
 
 # prune consecutive spaces
 def _cleanup_phones( phones, targets=[" "]):
@@ -500,6 +523,7 @@ class Dataset(_Dataset):
 			spkr_group = self.get_speaker_group(path)
 			#spkr_group_id = self.spkr_group_symmap[spkr_group]
 
+		"""
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
 
@@ -523,6 +547,16 @@ class Dataset(_Dataset):
 			#conds = (torch.from_numpy(metadata["conds"][0]), torch.from_numpy(metadata["conds"][1]))
 			latents = (torch.from_numpy(metadata["latent"][0]), torch.from_numpy(metadata["latent"][1]))
 			wav_length = metadata["wav_length"]
+		"""
+
+		mel, artifact = _load_artifact(path, return_artifact=True)
+		text = torch.from_numpy( artifact["text"].astype(int) ).to(self.text_dtype)
+		#conds = (torch.from_numpy(artifact["conds"][0]), torch.from_numpy(artifact["conds"][1]))
+		latents = (
+			torch.from_numpy(artifact["latent"][0].astype(float)).to(torch.float32),
+			torch.from_numpy(artifact["latent"][1].astype(float)).to(torch.float32)
+		)
+		wav_length = artifact["metadata"]["original_length"]
 
 		return dict(
 			index=index,
@@ -632,10 +666,17 @@ def create_train_val_dataloader():
 	return train_dl, subtrain_dl, val_dl
 
 def unpack_audio( npz ):
-	mel = npz["codes"].to(device="cpu")
+	mel = torch.from_numpy(npz["codes"].astype(int)).to(dtype=torch.int16, device="cpu")
 	
-	conds = npz["conds"][0].to(device="cpu"), npz["conds"][1].to(device="cpu")
-	latent = npz["latent"][0].to(device="cpu"), npz["latent"][1].to(device="cpu")
+	conds = (
+		torch.from_numpy(npz["conds"][0].astype(float)).to(dtype=torch.float32, device="cpu"),
+		torch.from_numpy(npz["conds"][1].astype(float)).to(dtype=torch.float32, device="cpu"),
+	)
+
+	latent = (
+		torch.from_numpy(npz["latent"][0].astype(float)).to(dtype=torch.float32, device="cpu"),
+		torch.from_numpy(npz["latent"][1].astype(float)).to(dtype=torch.float32, device="cpu"),
+	)
 
 	metadata = {}
 

@@ -26,7 +26,22 @@ To inference using the included Web UI: `python3 -m tortoise_tts.webui --yaml=".
 
 Training is as simple as copying the reference YAML from `./data/config.yaml` to any training directory of your choice (for examples: `./training/` or `./training/lora-finetune/`).
 
-A pre-processed dataset is required. Refer to [the VALL-E implementation](https://github.com/e-c-k-e-r/vall-e/blob/11fa3da66524a8dc2456420aedae9bec6de13c9d/README.md#leverage-your-own-dataset) for more details.
+#### Dataset
+
+A pre-processed dataset is required. Refer to [the VALL-E implementation](https://github.com/e-c-k-e-r/vall-e/blob/master/docs/data.md#leverage-your-own-dataset) for more details. But to reiterate:
+1. Populate your source voices under `./voices/{group name}/{speaker name}/.`
+
+2. Run `python3 -m tortoise_tts.emb.transcribe`. This will generate a transcription with timestamps for your dataset.
+
+3. Run `python3 -m tortoise_tts.emb.process`. This will phonemize the transcriptions and quantize the audio.
+
+4. Whever you copied the `./data/config.yaml`, populate `cfg.dataset.training` with strings `{group name}/{speaker name}`.
+
+5. Either copy, move, or symlink the resultant `./training/24KHz-mel/` folder to the directory containing your copied `config.yaml` as `data`.
+
+6. Run `python3 -m tortoise_tts.data --yaml="./path/to/your/training/config.yaml --action=metadata`  to generate additional metadata, as the dataloader code is slop and needs to be updated.
+
+#### Trainer
 
 To start the trainer, run `python3 -m tortoise_tts.train --yaml="./path/to/your/training/config.yaml`.
 + Type `save` to save whenever. Type `quit` to quit and save whenever. Type `eval` to run evaluation / validation of the model.
@@ -46,6 +61,7 @@ For LoRAs, replace the above `fp32.pth` with `lora.pth`.
 
 ## To-Do
 
+- [ ] Validate everything actually works still because dependencies break things over time
 - [ ] Re-backport all the creature comforts from VALL-E
 - [X] Reimplement original inferencing through TorToiSe (as done with `api.py`)
   - [ ] Reimplement candidate selection with the CLVP
