@@ -9,7 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .emb.mel import encode_from_files as encode_mel, trim, trim_random
-from .utils import to_device, set_seed, wrapper as ml
+from .utils import to_device, set_seed, ml
 
 from .config import cfg, DEFAULT_YAML
 from .models import get_models, load_model

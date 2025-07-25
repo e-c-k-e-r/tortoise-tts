@@ -6,3 +6,5 @@ __pycache__
 /tortoise_tts/version.py
 /.cache
 /voices
+/wandb
+/.nltk

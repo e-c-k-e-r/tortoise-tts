@@ -1,8 +1,9 @@
-# todo: back port this from vall-e
+# todo: clean this mess up
 
 import copy
 import h5py
 import json
+import re
 import logging
 import numpy as np
 import os
@@ -11,9 +12,12 @@ import torch
 import itertools
 
 from .config import cfg
-from .emb.mel import trim, trim_random, repeat_extend_audio, merge_audio, decode_to_file
+#from .emb.mel import post_process, trim, trim_random, repeat_extend_audio, concat_audio, merge_audio, decode_to_file, decode as decode_qnt, encode as encode_qnt, pad_codes_with_silence
+from .emb.mel import decode_to_file, decode as decode_qnt, encode as encode_qnt
 from .utils.sampler import PoolSampler, OrderedSampler, BatchedOrderedSampler, RandomSampler
-from .utils.distributed import global_rank, local_rank, world_size
+from .utils.distributed import global_rank, local_rank, world_size, is_global_leader
+from .utils.io import torch_save, torch_load, json_read, json_write, json_stringify, json_parse
+from .utils import setup_logging
 
 from collections import defaultdict
 from functools import cache, cached_property
@@ -31,35 +35,295 @@ from tqdm.auto import tqdm
 
 _logger = logging.getLogger(__name__)
 
+# cringe
+"""
+try:
+	import nltk
+	nltk.data.path.append("./.nltk/")
+	if not Path(".nltk").exists():
+		nltk.download('punkt_tab', download_dir="./.nltk/")
+except Exception as e:
+	nltk = None
+	_logger.warning(f"Error while querying for NTLK: {str(e)}")
+"""
+
+def sentence_split( s, split_by="sentences", quote_placeholder="<QUOTE>" ):
+	if split_by is None:
+		return [s]
+
+	# NTLK is not available, fallback
+	if nltk is None:
+		split_by = "\n"
+
+	# split by delimiter instead
+	if split_by != "sentences":
+		return s.split(split_by)
+
+	# use NTLK to handle splitting by sentences, because I don't want to write my own parser to split by punctuation
+	# nltk does not split quotations all that nicely, so we coerce them into placeholders, then replace afterwards
+	s = s.replace('"', quote_placeholder)
+	sentences = nltk.sent_tokenize(s)
+	return [ sentence.replace(quote_placeholder, '"') for sentence in sentences if sentence ]
+
+# normalization code borrowed from TorToiSe TTS
+# (it's not perfect but it works)
+
+try:
+	from tokenizers.normalizers import Lowercase, NFD, StripAccents
+	
+	normalizer = tokenizers.normalizers.Sequence([Lowercase(), NFD(), StripAccents()])
+except Exception as e:
+	normalizer = None
+
+# List of (regular expression, replacement) pairs for abbreviations:
+_abbreviations = [(re.compile('\\b%s\\.' % x[0], re.IGNORECASE), x[1]) for x in [
+	('mrs', 'misess'),
+	('mr', 'mister'),
+	('dr', 'doctor'),
+	('st', 'saint'),
+	('co', 'company'),
+	('jr', 'junior'),
+	('maj', 'major'),
+	('gen', 'general'),
+	('drs', 'doctors'),
+	('rev', 'reverend'),
+	('lt', 'lieutenant'),
+	('hon', 'honorable'),
+	('sgt', 'sergeant'),
+	('capt', 'captain'),
+	('esq', 'esquire'),
+	('ltd', 'limited'),
+	('col', 'colonel'),
+	('ft', 'fort'),
+]]
+def normalize_abbreviations(text):
+	for regex, replacement in _abbreviations:
+		text = re.sub(regex, replacement, text)
+	return text
+
+def _remove_commas(m):
+	return m.group(1).replace(',', '')
+
+def _expand_decimal_point(m):
+	return m.group(1).replace('.', ' point ')
+
+def _expand_dollars(m):
+	match = m.group(1)
+	parts = match.split('.')
+	if len(parts) > 2:
+		return match + ' dollars' # Unexpected format
+	dollars = int(parts[0]) if parts[0] else 0
+	cents = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+	if dollars and cents:
+		dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+		cent_unit = 'cent' if cents == 1 else 'cents'
+		return '%s %s, %s %s' % (dollars, dollar_unit, cents, cent_unit)
+	elif dollars:
+		dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+		return '%s %s' % (dollars, dollar_unit)
+	elif cents:
+		cent_unit = 'cent' if cents == 1 else 'cents'
+		return '%s %s' % (cents, cent_unit)
+	else:
+		return 'zero dollars'
+
+# in case the current env does not have it installed, so I don't need it as a hard dependency
+try:
+	import inflect
+
+	_inflect = inflect.engine()
+
+	def _expand_ordinal(m):
+		return _inflect.number_to_words(m.group(0))
+
+	def _expand_number(m):
+		num = int(m.group(0))
+		if num > 1000 and num < 3000:
+			if num == 2000:
+				return 'two thousand'
+			elif num > 2000 and num < 2010:
+				return 'two thousand ' + _inflect.number_to_words(num % 100)
+			elif num % 100 == 0:
+				return _inflect.number_to_words(num // 100) + ' hundred'
+			else:
+				return _inflect.number_to_words(num, andword='', zero='oh', group=2).replace(', ', ' ')
+		else:
+			return _inflect.number_to_words(num, andword='')
+except Exception as e:
+	_inflect = None
+
+_comma_number_re = re.compile(r'([0-9][0-9\,]+[0-9])')
+_decimal_number_re = re.compile(r'([0-9]+\.[0-9]+)')
+_pounds_re = re.compile(r'£([0-9\,]*[0-9]+)')
+_dollars_re = re.compile(r'\$([0-9\.\,]*[0-9]+)')
+_ordinal_re = re.compile(r'[0-9]+(st|nd|rd|th)')
+_number_re = re.compile(r'[0-9]+')
+_whitespace_re = re.compile(r'\s+')
+_end_punct_re = re.compile(r'[\.\?\!]$')
+_aux_punct_re = re.compile(r'[,;:\?\.\!-]')
+
+def normalize_numbers(text):
+	text = re.sub(_comma_number_re, _remove_commas, text)
+	text = re.sub(_pounds_re, r'\1 pounds', text)
+	text = re.sub(_dollars_re, _expand_dollars, text)
+	text = re.sub(_decimal_number_re, _expand_decimal_point, text)
+	if _inflect is not None:
+		text = re.sub(_ordinal_re, _expand_ordinal, text)
+		text = re.sub(_number_re, _expand_number, text)
+	return text
+
+# full will do aggressive normalization, perfect for WER/CER
+# not full will do basic cleaning
+def normalize_text(text, language="auto", full=True):
+	if full:
+		if normalizer is not None:
+			text = normalizer.normalize_str( text )
+		else:
+			text = text.lower()
+		text = normalize_numbers(text) # expand numbers
+		text = normalize_abbreviations(text) # expand abbreviations
+		#text = re.sub(_end_punct_re, '', text) # collapse whitespace
+		text = re.sub(_aux_punct_re, '', text) # collapse whitespace
+		text = text.replace('"', '') # remove quotation marks
+	else:
+		text = normalize_numbers(text) # expand numbers
+		text = normalize_abbreviations(text) # expand abbreviations
+		text = re.sub(_whitespace_re, ' ', text) # collapse whitespace
+
+	# to-do: other languages
+	return text
+
+@cache
+def get_random_prompts( validation=False, min_length=0, tokenized=False, source_path=Path("./data/harvard_sentences.txt") ):
+	duration_range = [ 5.5, 12.0 ] # to-do: pull from cfg.dataset.duration_range
+	sentences = [
+		"The birch canoe slid on the smooth planks.",
+		"Glue the sheet to the dark blue background.",
+		"It's easy to tell the depth of a well.",
+		"These days a chicken leg is a rare dish.",
+		"Rice is often served in round bowls.",
+		"The juice of lemons makes fine punch.",
+		"The box was thrown beside the parked truck.",
+		"The hogs were fed chopped corn and garbage.",
+		"Four hours of steady work faced us.",
+		"A large size in stockings is hard to sell.",
+		"The boy was there when the sun rose.",
+		"A rod is used to catch pink salmon.",
+		"The source of the huge river is the clear spring.",
+		"Kick the ball straight and follow through.",
+		"Help the woman get back to her feet.",
+		"A pot of tea helps to pass the evening.",
+		"Smoky fires lack flame and heat.",
+		"The soft cushion broke the man's fall.",
+		"The salt breeze came across from the sea.",
+		"The girl at the booth sold fifty bonds.",
+		"The small pup gnawed a hole in the sock.",
+		"The fish twisted and turned on the bent hook.",
+		"Press the pants and sew a button on the vest.",
+		"The swan dive was far short of perfect.",
+		"The beauty of the view stunned the young boy.",
+		"Two blue fish swam in the tank.",
+		"Her purse was full of useless trash.",
+		"The colt reared and threw the tall rider.",
+		"It snowed, rained, and hailed the same morning.",
+		"Read verse out loud for pleasure.",
+		"Perfect. Please move quickly to the chamber lock, as the effect of prolonged exposure to the button are not part of this test.",
+	]
+
+	if source_path.exists():
+		sentences = open( source_path, "r", encoding="utf-8" ).read().split("\n")
+
+	# Pull from validation dataset if existing + requested
+	if validation and cfg.dataset.validation:
+		paths = _load_paths(cfg.dataset.validation, type="validation", silent=True)
+		paths = list(itertools.chain.from_iterable(paths.values()))
+		
+		for path in paths:
+			duration = 0
+			text_string = ""
+			if cfg.dataset.use_hdf5:
+				key = _get_hdf5_path(path)
+
+				metadata = { f'{k}': f'{v}' for k, v in cfg.hdf5[key].attrs.items() }
+				metadata = process_artifact_metadata( { "metadata": metadata } )
+				text_string = metadata["text"] if "text" in metadata else ""
+				duration = metadata['duration'] if "duration" in metadata else 0
+			else:
+				_, metadata = _load_artifact(path, return_metadata=True)
+				metadata = process_artifact_metadata( { "metadata": metadata } )
+				text_string = metadata["text"] if "text" in metadata else ""
+				duration = metadata['duration'] if "duration" in metadata else 0
+			
+			if len( text_string ) < min_length or not (duration_range[0] <= duration and duration <= duration_range[1]):
+				continue
+
+			sentences.append( text_string )
+
+	# tokenize here because our harvard sentences need to be phonemized anyways
+	"""
+	if tokenized:
+		return [ torch.tensor( tokenize( encode_phns( text ) ) ).to(dtype=torch.uint8) for text in sentences ]
+	"""
+
+	return sentences
+
+# samples a random text prompt
+def get_random_prompt( *args, **kwargs ):
+	# Harvard sentences
+	return random.choice(get_random_prompts( *args, **kwargs ))
+
 # to-do: clean up this symmap mess
 def get_phone_symmap():
 	return cfg.tokenizer.get_vocab()
 
 def tokenize( phones ):
-	return cfg.tokenizer.encode( "".join(phones) )
+	if isinstance( phones, list ):
+		phones = "".join( phones )
+	return cfg.tokenizer.encode( phones )
+
+def text_tokenize( text ):
+	if isinstance( text, list ):
+		text = "".join( text )
+	return cfg.text_tokenizer.encode( text )
 
 def get_lang_symmap():
 	return {
 		"en": 0,
 		"ja": 1,
+		"de": 2,
+		"fr": 3,
+		"zh": 4, # mandarin I presume
+		"ko": 5,
 	}
 
 def get_tone_symmap():
 	return {
 		"neutral": 0,
+		# could use 4 instead of 8 basic emotions
+		# "joy": 1,
+		# "fear": 2,
+		# "surprise": 3,
+		# "anger": 4,
 	}
-	return symmap
 
 def get_task_symmap():
 	return {
-		"<tts>": 0,
-		"<tts-c>": 1,
-		"<ns>": 2,
-		"<sr>": 3,
-		"<tse>": 4,
-		"<soe>": 5,
-		"<mask>": 6,
-		"<eoe>": 7,
+		"tts": 0,
+		"tts-c": 1,
+		"ns": 2,
+		"sr": 3,
+		"tse": 4,
+		"soe": 5,
+		"mask": 6,
+		"eoe": 7,
+		"stt": 8,
+
+		"len": 0, # fake
+		"nse": 6, # fake
+		"cse": 6, # fake
+		
+		"phn": 0, # fake
+		"un-phn": 0, # fake
 	}
 
 def _replace_file_extension(path, suffix):
@@ -67,26 +331,91 @@ def _replace_file_extension(path, suffix):
 		path = Path(path)
 	return (path.parent / path.name.split(".")[0]).with_suffix(suffix)
 
-def _get_mel_extension():
-	return ".mel"
-
-def _get_phone_extension():
-	return ".json"
-
-def _get_mel_path(path):
-	return _replace_file_extension(path, _get_mel_extension())
-
-def _get_phone_path(path):
-	return _replace_file_extension(path, _get_phone_extension())
-
 def _get_artifact_extension():
-	return _get_mel_extension()
+	#return ".dac" if cfg.audio_backend == "dac" else ".enc"
+	return cfg.audio_backend_extension
 
 def _get_metadata_extension():
-	return _get_phone_extension()
+	return ".json"
 
 def _get_artifact_path(path):
 	return _replace_file_extension(path, _get_artifact_extension())
+
+def _get_path_key( type, dir, id ):
+	return f"/{type}/{_get_hdf5_path(dir)}/{id}" if cfg.dataset.use_hdf5 else str(dir / id)
+
+def _load_dataset_metadata(dataset, type="training", silent=not is_global_leader(), dataset_hash_key=None):
+	assert cfg.dataset.min_duration >= 1.0, "Minimum duration too low."
+	
+	# for now only ensure metadata-based path
+	assert cfg.dataset.use_metadata, "Metadata required."
+
+	if not dataset_hash_key:
+		dataset_hash_key = cfg.dataset.hash_key(sorted(dataset))
+
+	cached_dir = cfg.cache_dir / dataset_hash_key
+	cached_path = cached_dir / f"dataset[{type}].json"
+
+	if cached_path.exists() and cfg.dataset.cache:
+		return json_read( cached_path )
+
+	dataset_metadata = {}
+	def validate_utterance( id, entry ):
+		duration = entry.get('duration', 0)
+		in_bounds = cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
+		
+		if cfg.dataset.validate and type == "training" and not in_bounds:
+			return False
+
+		if cfg.dataset.strict_validate:
+			if cfg.dataset.use_hdf5 and key(type, dir, id) not in cfg.hdf5:
+				return False
+
+			if not (cfg.data_dir / dir / id).with_suffix(_get_artifact_extension()).exists():
+				return False
+
+		return True
+
+	def process_utterance( id, entry, metadata_keys=None ):
+		duration = entry.get('duration', 0)
+		similar = entry.get('similar', None)
+		# store duration length, and similar key name (because indices might shift)
+		return [duration, ([ metadata_keys[idx] for idx in similar ] if similar and metadata_keys else [])]
+
+	for dir in tqdm(dataset, desc=f"Parsing dataset: {type}", disable=silent ):
+		metadata_path = cfg.metadata_dir / f'{dir}.json'
+		if not metadata_path.exists():
+			continue
+
+		# to-do: make json_read handle when it actually can't read the file......
+		try:
+			metadata = json_read( metadata_path )
+		except Exception as e:
+			continue
+
+		speaker = str(dir)
+		metadata_keys = list(metadata.keys())
+		dataset_metadata[speaker] = { id: process_utterance( id, entry, metadata_keys ) for id, entry in metadata.items() if validate_utterance( id, entry ) }
+
+		# remap strings to indices
+		remapped_indices = { k: i for i, k in enumerate(dataset_metadata[speaker].keys()) }
+		for id, (duration, similars) in dataset_metadata[speaker].items():
+			dataset_metadata[speaker][id][1] = [ remapped_indices[k] for k in similars if k in remapped_indices ]
+
+	# and write if global leader (to avoid other processes writing to the same file at once)
+	if is_global_leader():
+		if not cached_dir.exists():
+			cached_dir.mkdir(parents=True, exist_ok=True)
+
+		json_write( dataset_metadata, cached_path, truncate=True )
+
+	return dataset_metadata
+
+def _get_paths_of_extensions( path, extensions=_get_artifact_extension(), validate=False ):
+	if isinstance(path, str):
+		path = Path(path)
+	
+	return [ str(p) for p in list(path.iterdir()) ] if path.exists() and path.is_dir() else []
 
 def _load_artifact(path, return_metadata=False, return_artifact=False, validate=True) -> Tensor:
 	artifact = np.load(_get_artifact_path(path), allow_pickle=True)[()]
@@ -96,6 +425,7 @@ def _load_artifact(path, return_metadata=False, return_artifact=False, validate=
 		raise Exception(f"Artifact contains zero'd tensor: {path}")
 
 	codes = torch.from_numpy(codes.astype(int)).to(torch.int16)
+	# codes = post_process( codes )
 
 	if return_artifact:
 		return codes, artifact
@@ -104,116 +434,6 @@ def _load_artifact(path, return_metadata=False, return_artifact=False, validate=
 		return codes, artifact["metadata"]
 
 	return codes
-
-_durations_map = {}
-# makeshift caching the above to disk
-@cfg.diskcache()
-def _get_duration_map( type="training" ):
-	return _durations_map[type] if type in _durations_map else {}
-
-@cfg.diskcache()
-def _load_paths(dataset, type="training"):
-	return { cfg.get_spkr( cfg.data_dir / data_dir / "dummy" ): _load_paths_from_metadata( data_dir, type=type, validate=cfg.dataset.validate and type == "training" ) for data_dir in tqdm(dataset, desc=f"Parsing dataset: {type}") }
-
-def _load_paths_from_metadata(group_name, type="training", validate=False):
-	data_dir = group_name if cfg.dataset.use_hdf5 else cfg.data_dir / group_name
-
-	_fn = _get_hdf5_paths if cfg.dataset.use_hdf5 else _get_paths_of_extensions
-
-	def key( id, entry=None ):
-		return f"/{type}/{_get_hdf5_path(data_dir)}/{id}" if cfg.dataset.use_hdf5 else data_dir / id
-
-	metadata_path = cfg.metadata_dir / f'{group_name}.json'
-	metadata = {}
-
-	if cfg.dataset.use_metadata and metadata_path.exists():
-		metadata = json.loads(open( metadata_path, "r", encoding="utf-8" ).read())
-
-	if len(metadata) == 0:
-		return _fn( data_dir, type if cfg.dataset.use_hdf5 else _get_mel_extension(), validate )
-
-	def _validate( id, entry ):
-		phones = entry['phones'] if "phones" in entry else 0
-		duration = entry['duration'] if "duration" in entry else 0
-
-		# add to duration bucket
-		k = key(id, entry)
-		if type not in _durations_map:
-			_durations_map[type] = {}
-		_durations_map[type][k] = duration
-
-		if not validate:
-			return True
-
-		return cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
-
-	return [ key(id, entry) for id, entry in metadata.items() if _validate(id, entry) ]
-
-
-def _get_hdf5_path(path):
-	# to-do: better validation
-	#print(path)
-	return str(path)
-
-def _get_hdf5_paths( data_dir, type="training", validate=False ):
-	data_dir = str(data_dir)
-	
-	key = f"/{type}/{_get_hdf5_path(data_dir)}"
-
-	def _validate( id, entry ):
-		phones = entry.attrs['phonemes']
-		duration = entry.attrs['duration']
-
-		if type not in _durations_map:
-			_durations_map[type] = {}
-		_durations_map[type][f"{key}/{id}"] = duration
-
-		if not validate:
-			return True
-		
-		return cfg.dataset.min_duration <= duration and duration <= cfg.dataset.max_duration
-
-	return [ Path(f"{key}/{id}") for id, entry in cfg.hdf5[key].items() if _validate(id, entry) ] if key in cfg.hdf5 else []
-
-def _get_paths_of_extensions( path, extensions=_get_mel_extension(), validate=False ):
-	if isinstance(path, str):
-		path = Path(path)
-
-	def _validate(path):
-		if "".join(path.suffixes) not in extensions:
-			return False
-		if not _get_phone_path(path).exists() or not _get_mel_path(path).exists():
-			return False
-		if not validate:
-			return True
-		# to-do: find an easy way to determine size from pickled mels without loading
-		# to-do: find a consistent way to derive phoneme count from filesize (probably can't due to utf-8)
-		phones = len(_get_phones(_get_phone_path(path))) # _get_phone_path(path).stat().st_size // 2 + 1
-		return cfg.dataset.min_phones <= phones and phones <= cfg.dataset.max_phones
-
-
-	return [ p for p in list(path.iterdir()) if _validate(p) ] if path.exists() and path.is_dir() else []
-
-def _load_mels(path, return_metadata=False) -> Tensor:
-	return _load_artifact(path, return_metadata)
-
-# prune consecutive spaces
-def _cleanup_phones( phones, targets=[" "]):
-	return [ p for i, p in enumerate(phones) if p not in targets or ( p in targets and p != phones[i-1] ) ]
-
-@cache
-def _get_phones(path):
-	phone_path = _get_phone_path(path)
-	mel_path = _get_mel_path(path)
-	if phone_path.exists():
-		metadata = json.loads(open(phone_path, "r", encoding="utf-8").read())
-	elif mel_path.exists():
-		_, metadata = _load_mels( path, return_metadata=True )
-	else:
-		raise Exception(f"Could not load phonemes: {path}")
-
-	content = metadata["phonemes"]
-	return "".join(content)
 
 def _interleaved_reorder(l, fn):
 	groups = defaultdict(list)
@@ -230,196 +450,202 @@ class Dataset(_Dataset):
 		self,
 		phone_symmap=None,
 		training=False,
-		extra_paths_by_spkr_name: dict[str, list] = {},
+		extra_paths_by_speaker_name: dict[str, list] = {},
 	):
 		super().__init__()
+
 		self._head = None
-		self.shuffle = False
 		self.sampler = None
 
 		self.paths = []
 
 		self.training = training
 		self.dataset_type = "training" if self.training else "validation"
-		self.dataset = cfg.dataset.training if self.training else cfg.dataset.validation
-		self.sampler_type = cfg.dataset.sample_type # if self.dataset_type == "training" else "group"
+		self.sampler_type = cfg.dataset.sample_type if self.dataset_type == "training" else "path"
 		self.sampler_order = cfg.dataset.sample_order
+		self.sampler_shuffle = cfg.dataset.sample_shuffle if self.dataset_type == "training" else True
 
-		# to-do: do not do validation if there's nothing in the validation
-		# this just makes it be happy
-		if len(self.dataset) == 0:
-			self.dataset = cfg.dataset.training
+		dataset = sorted(cfg.dataset.training if self.training else cfg.dataset.validation)
+		self.dataset_hash_key = cfg.dataset.hash_key(dataset)
 		
-		# dict of paths keyed by speaker names
-		self.paths_by_spkr_name = _load_paths(self.dataset, self.dataset_type)
+		self.duration = 0
+		self.duration_buckets = {}
+		self.current_index = 0
+		self.batch_size = cfg.hyperparameters.batch_size if self.training else cfg.evaluation.batch_size
 
-		# cull speakers if they do not have enough utterances
-		if cfg.dataset.min_utterances > 0:
-			keys = list(self.paths_by_spkr_name.keys())
-			for key in keys:
-				if len(self.paths_by_spkr_name[key]) < cfg.dataset.min_utterances:
-					del self.paths_by_spkr_name[key]
-
-		# flatten paths
-		self.paths = list(itertools.chain.from_iterable(self.paths_by_spkr_name.values()))
+		# hard error because I kept getting tricked by this myself
+		if self.sampler_order == "duration" and self.sampler_type != "path":
+			raise Exception(f'Requesting sample_type={self.sampler_type} with sample_order={self.sampler_order}, yet combination will not give expected results.')
 		
+		# dict that maps [speaker][id] to (duration, similar utterances)
+		self.metadata = _load_dataset_metadata(dataset, self.dataset_type, dataset_hash_key=self.dataset_hash_key)
+
+		if len(self.metadata) == 0:
+			raise Exception(f'Empty dataset for {self.dataset_type}')
+		
+		# cull speakers with too little utterances
+		prune_keys = [ speaker for speaker in self.metadata.keys() if len(self.metadata[speaker]) < cfg.dataset.min_utterances ]
+		for speaker in prune_keys:
+			del self.metadata[speaker]
+
+		self.paths = []
+		self.speakers = list(self.metadata.keys())
+		self.paths = [ ((speaker_id, utterance_id), self.metadata[speaker][utterance][0]) for speaker_id, speaker in enumerate(self.speakers) for utterance_id, utterance in enumerate(self.metadata[speaker].keys()) ]
+
 		# split dataset accordingly per GPU
 		if cfg.distributed and self.training:
-			batches = len(self.paths) // world_size()
-			start = batches * global_rank()
-			end = batches * (global_rank() + 1)
+			self.paths = [ path for i, path in enumerate(self.paths) if i % world_size() == 0 ]
 
-			self.paths = self.paths[start:end]
-
-			# recreate paths_by_spkr_name
-			self.paths_by_spkr_name = {}
-			for path in self.paths:
-				name = cfg.get_spkr( Path(path) )
-				if name not in self.paths_by_spkr_name:
-					self.paths_by_spkr_name[name] = []
-				self.paths_by_spkr_name[name].append( path )
-
-		# do it here due to the above
-		self.duration = 0
-		self.duration_map = _get_duration_map( self.dataset_type )
-		self.duration_buckets = {}
-
-		# store in corresponding bucket
-		for path in self.paths:
-			duration = self.duration_map[path]
+		for ((speaker_id, utterance_id), duration) in self.paths:
 			self.duration += duration
 			
-			# only calc duration if we're tot going to order by duration
+			# only calc duration if we're going to order by duration
 			if self.sampler_order != "duration":
 				continue
 
 			bucket = int(round(duration))
 			if bucket not in self.duration_buckets:
 				self.duration_buckets[bucket] = []
-			self.duration_buckets[bucket].append( ( Path(path), duration ) )
-
-		# ensure they're ordered
-		self.duration_buckets = dict(sorted(self.duration_buckets.items()))
+			self.duration_buckets[bucket].append( ( (speaker_id, utterance_id), duration ) )
 
 		# sort by duration
 		if self.sampler_order == "duration":
+			# ensure they're ordered
+			self.duration_buckets = dict(sorted(self.duration_buckets.items()))
+
 			flattened = {}
 			# sort and interleave
 			for bucket in self.duration_buckets:
 				# sort by duration
-				self.duration_buckets[bucket].sort( key=lambda x: x[1] )
+				self.duration_buckets[bucket].sort( key=lambda x: x[-1] )
 				# split to retain tuples
 				flattened[bucket] = self.duration_buckets[bucket]
+				"""
 				# replace with path
 				flattened[bucket] = [ x[0] for x in flattened[bucket] ]
+				"""
 				# flatten by paths
-				flattened[bucket] = [*_interleaved_reorder(flattened[bucket], self.get_speaker)]
+				flattened[bucket] = [*_interleaved_reorder(flattened[bucket], lambda x: x[0])]
 			# flatten paths
 			self.paths = list(itertools.chain.from_iterable(flattened.values()))
-		elif self.sampler_order == "shuffle":
+		elif self.sampler_order == "random":
+			random.shuffle( self.paths )
+		else:
 			# just interleave
-			self.paths = [*_interleaved_reorder(self.paths, self.get_speaker)]
+			self.paths = [*_interleaved_reorder(self.paths, lambda x: x[0])]
 
-		
-		# dict of speakers keyed by speaker group
-		self.spkrs_by_spkr_group = {}
-		for data_dir in self.dataset:
-			spkr = cfg.get_spkr( data_dir / "dummy" )
-			spkr_group = cfg.get_spkr_group( data_dir / "dummy" )
-
-			if spkr not in self.paths_by_spkr_name or len(self.paths_by_spkr_name[spkr]) < cfg.dataset.min_utterances:
-				continue
-
-			if spkr_group not in self.spkrs_by_spkr_group:
-				self.spkrs_by_spkr_group[spkr_group] = []
-
-			self.spkrs_by_spkr_group[spkr_group].append( spkr )
-
-		self.spkr_groups = list(self.spkrs_by_spkr_group.keys())
-
-		self.noise_paths = _load_paths(cfg.dataset.noise, "noise")
-		self.noise_paths = list(itertools.chain.from_iterable(self.noise_paths.values()))
+		self.noise_metadata = _load_dataset_metadata(cfg.dataset.noise, "noise", dataset_hash_key=self.dataset_hash_key)
+		self.noise_speakers = list(self.noise_metadata.keys())
+		self.noise_paths = [ (speaker_id, utterance_id) for speaker_id, speaker in enumerate(self.noise_speakers) for utterance_id, utterance in enumerate(self.noise_metadata[speaker].keys()) ]
 
 		self.phone_symmap = phone_symmap or self._get_phone_symmap()
-		self.spkr_symmap = self._get_spkr_symmap()
-		self.spkr_group_symmap = self._get_spkr_group_symmap()
+		self.speaker_symmap = self._get_speaker_symmap()
 		self.lang_symmap = self._get_lang_symmap()
 		self.tone_symmap = self._get_tone_symmap()
 		self.task_symmap = self._get_task_symmap()
+
+		# grab IDs for bos, space, and eos for easy input creation later
+		try:
+			self.empty_text = [ cfg.tokenizer._bos_token, cfg.tokenizer.get_vocab()[" "], cfg.tokenizer._eos_token ]
+		except Exception as e:
+			self.empty_text = [None, None, None]
+
+		# have it fetch at training time if any is invalid, because the tokenizer obj might not have it easily fetchable ahead of itme
+		# encoding before parallelizing things causes things to whine
+		if self.empty_text[0] is None or self.empty_text[-1] is None:
+			self.empty_text = None
 
 		# assert len(self.phone_symmap) < 256, "Unique token count should be [0,255] to fit within uint8"
 		self.text_dtype = torch.uint8 if len(self.phone_symmap) < 256 else torch.int16
 
 		if len(self.paths) == 0:
 			raise ValueError(f"No valid path is found for {self.dataset_type}")
-		
 
-		sampler_path = cfg.rel_path / f"sampler.{self.sampler_type}.rank{global_rank()}.pt"
-
-		if self.sampler_type == "path":
-			if self.sampler_order == "duration" and cfg.dataset.sample_max_duration_batch > 0:
-				self.sampler = BatchedOrderedSampler( self.duration_buckets, cfg.dataset.sample_max_duration_batch, cfg.hyperparameters.batch_size if training else cfg.evaluation.batch_size )
-			else:
-				self.sampler = OrderedSampler( len(self) )
-			self.samplers = {}
-			self.spkr_samplers = {}
+		if self.training and self.sampler_order == "duration" and cfg.dataset.sample_max_duration_batch > 0:
+			self.sampler = BatchedOrderedSampler(
+				self.duration_buckets if not self.sampler_state_dict_path.exists() else {}, # pass nothing if we're just going to load from a state anyways
+				max_duration=cfg.dataset.sample_max_duration_batch,
+				max_batch_size=self.batch_size,
+				shuffle=self.sampler_shuffle,
+			)
+			self.batch_size = 1
 		else:
-			self.sampler = RandomSampler( len(self) )
-			self.samplers = { name: PoolSampler( paths, keep_all=True ) for name, paths in self.paths_by_spkr_name.items() }
-			self.spkr_samplers = { name: PoolSampler( [*set(speakers)], keep_all=True ) for name, speakers in self.spkrs_by_spkr_group.items() }
+			self.sampler = OrderedSampler( len(self) ) if not self.sampler_shuffle else RandomSampler( len(self) )
 
 		self.load_state_dict()
+
+	@cached_property
+	def sampler_state_dict_path(self):
+		return cfg.ckpt_dir / (cfg.lora.full_name if cfg.lora is not None else cfg.model.full_name) / f"sampler.{self.sampler_type}.rank{global_rank()}.pt"
 		
 	def get_speaker(self, path):
 		if isinstance(path, str):
 			path = Path(path)
-		res = cfg.get_spkr(path)
+		res = cfg.get_speaker(path)
 		return res
 
 	def get_speaker_group(self, path):
 		if isinstance(path, str):
 			path = Path(path)
-		res = cfg.get_spkr_group(path)
+		res = cfg.get_speaker_group(path)
 		return res
 
-	def get_language(self, speaker_group):
-		lang = "en"
+	# this isn't really necessary since our data/metadata contains markers for languages, but this is still in in-case it's needed to force a language setting (for example, whisperX's lang isn't that accurate at times)
+	def get_language(self, speaker_group, lang="en"):
 		for k, v in cfg.dataset.speaker_languages.items():
 			if speaker_group in v:
 				lang = k
 				break
 
-		return lang
-
-	@cached_property
-	def spkrs(self):
-		return sorted({self.get_speaker(path) for path in self.paths})
+		return lang.lower()
 
 	@cached_property
 	def tasks(self):
+		if not self.training:
+			return ["tts"]
 		return cfg.dataset.tasks_list # ["tts", "tts", "ns", "sr", "tse", "tts", "tts"] # , "cse", "nse"
 
 	def save_state_dict(self, path = None):
 		if path is None:
-			path = cfg.rel_path / f"sampler.{self.sampler_type}.rank{global_rank()}.pt"
+			path = self.sampler_state_dict_path
 
+		if not path.parent.exists():
+			path.parent.mkdir(parents=True, exist_ok=True)
+
+		state_dict = self.sampler.get_state()
+		"""
 		if self.sampler_type == "path":
 			state_dict = self.sampler.get_state()
 		else:
 			state_dict = {
 				"samplers": { name: sampler.get_state() for name, sampler in self.samplers.items() },
-				"spkr_samplers": { name: sampler.get_state() for name, sampler in self.spkr_samplers.items() },
+				"speaker_samplers": { name: sampler.get_state() for name, sampler in self.speaker_samplers.items() },
 			}
-		torch.save(state_dict, path)
+		"""
+
+		if "dataset_hash_key" not in state_dict:
+			 state_dict["dataset_hash_key"] = self.dataset_hash_key
+
+		torch_save(state_dict, path)
 
 	def load_state_dict(self, path = None):
+		if not self.training:
+			return
+
 		if path is None:
-			path = cfg.rel_path / f"sampler.{self.sampler_type}.rank{global_rank()}.pt"
+			path = self.sampler_state_dict_path
 
 		if not path.exists():
 			return
 
-		state_dict = torch.load(path)
+		state_dict = torch_load(path)
+		if "dataset_hash_key" in state_dict:
+			if self.dataset_hash_key != state_dict["dataset_hash_key"]:
+				_logger.warning(f'Mismatched dataset hash key for {self.dataset_type} dataloader, ignoring loading of state dict.')
+				return
+
+		state_dict = self.sampler.set_state(state_dict)
+		"""
 		if self.sampler_type == "path":
 			state_dict = self.sampler.set_state(state_dict)
 		else:
@@ -428,19 +654,17 @@ class Dataset(_Dataset):
 					continue
 				self.samplers[name].set_state( sampler )
 
-			for name, sampler in state_dict["spkr_samplers"].items():
-				if name not in self.spkr_samplers:
+			for name, sampler in state_dict["speaker_samplers"].items():
+				if name not in self.speaker_samplers:
 					continue
-				self.spkr_samplers[name].set_state( sampler )
+				self.speaker_samplers[name].set_state( sampler )
+		"""
 
 	def _get_phone_symmap(self):
 		return get_phone_symmap()
 
-	def _get_spkr_symmap(self):
-		return {s: i for i, s in enumerate(self.spkrs)}
-
-	def _get_spkr_group_symmap(self):
-		return {s: i for i, s in enumerate(self.spkr_groups)}
+	def _get_speaker_symmap(self):
+		return {s: i for i, s in enumerate(self.speakers)}
 
 	def _get_lang_symmap(self):
 		return get_lang_symmap()
@@ -451,107 +675,160 @@ class Dataset(_Dataset):
 	def _get_task_symmap(self):
 		return get_task_symmap()
 
-	"""
-	def get_task_token( self, token, levels=cfg.model.max_levels ):
-		if not hasattr(self, "task_symmap"):
-			self.task_symmap = self._get_task_symmap()
-		return torch.Tensor([[ self.task_symmap[f'<{token}>'] for _ in range(levels) ]]).to(dtype=torch.int16)
-	"""
-
 	def sample_noise(self):
-		path = random.choice(self.noise_paths)
+		speaker_id, utterance_id = random.choice(self.noise_paths)
+		
+		speaker_name = self.noise_speakers[speaker_id]
+		utterance_name = list(self.noise_metadata[speaker_name].keys())[utterance_id]
+
+		path = cfg.data_dir / speaker_name / utterance_name
 
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
-			mel = torch.from_numpy(cfg.hdf5[key]["audio"]).to(torch.int16)
+			qnt = torch.from_numpy(cfg.hdf5[key]["audio"][:, :]).to(torch.int16)
 		else:
-			mel = _load_mels(path, return_metadata=False)
-		return mel
+			qnt = _load_artifact(path, return_metadata=False, return_artifact=False)
+		return qnt
 
 	def sample_speakers(self, ignore=[]):
-		choices = set(self.spkrs) - set(ignore)
+		choices = set(self.speakers) - set(ignore)
 		return random.choice([*choices])
 
-	def sample_prompts(self, spkr_name, ignore):
-		prom_list = []
+	def sample_utterance(self, speaker_name, ignore=[]):
+		choices = [*(set(self.metadata[speaker_name].keys()) - set(ignore))]
 
-		choices = set(self.paths_by_spkr_name[spkr_name]) - {ignore}
-		choices = [*choices]
-
-		# no other utterances, it'd make more sense to prune speakers with only one utterance in the validation step
 		if len(choices) == 0:
-			choices = [*set(self.paths_by_spkr_name[spkr_name])]
-			"""
-			raise ValueError(
-				f"Failed to find another different utterance for {spkr_name}."
-			)
-			"""
-
-		path = random.choice(choices)
-		if cfg.dataset.use_hdf5:
-			key = _get_hdf5_path(path)
-
-			if "audio" not in cfg.hdf5[key]:
-				_logger.warning(f'MISSING AUDIO: {key}')
-				return
-
-			# audio / cond / latents
-			# parameter names and documentation are weird
-			prom = torch.from_numpy(cfg.hdf5[key]["cond"]).to(torch.int16)
-		else:
-			prom = _load_mels(path, return_metadata=False)
-
-		return prom
-
-	def __getitem__(self, index):
-		if self.sampler_type == "group":
-			spkr_group = self.spkr_groups[index]
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
-			spkr_name = self.spkr_samplers[spkr_group].sample()
-			spkr_id = self.spkr_symmap[spkr_name]
-			path = self.samplers[spkr_name].sample()
-		elif self.sampler_type == "speaker":
-			spkr_name = self.spkrs[index]
-			spkr_id = self.spkr_symmap[spkr_name]
-			path = self.samplers[spkr_name].sample()
-			spkr_group = self.get_speaker_group(path)
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
-		else:
-			path = self.paths[index]
-			spkr_name = self.get_speaker(path)
-			spkr_id = self.spkr_symmap[spkr_name]
-			spkr_group = self.get_speaker_group(path)
-			#spkr_group_id = self.spkr_group_symmap[spkr_group]
-
-		"""
+			return None, None, None
+		
+		utterance_id = random.choice(choices)
+		utterance_name = list(self.metadata[speaker_name].keys())[utterance_id]
+			
+		path = cfg.data_dir / speaker_name / utterance_name
 		if cfg.dataset.use_hdf5:
 			key = _get_hdf5_path(path)
 
 			if key not in cfg.hdf5:
 				raise RuntimeError(f'Key of Path ({path}) not in HDF5: {key}')
 
+			#metadata = cfg.hdf5[key].attrs
+			metadata = { f'{k}': f'{v}' for k, v in cfg.hdf5[key].attrs.items() }
+
 			text = cfg.hdf5[key]["text"][:]
-			mel = cfg.hdf5[key]["audio"][:]
-			#conds = (cfg.hdf5[key]["conds_0"][:], cfg.hdf5[key]["conds_1"][:])
-			latents = (cfg.hdf5[key]["latents_0"][:], cfg.hdf5[key]["latents_1"][:])
+			resps = cfg.hdf5[key]["audio"][:, :]
 			
 			text = torch.from_numpy(text).to(self.text_dtype)
-			mel = torch.from_numpy(mel).to(torch.int16)
-			#conds = (torch.from_numpy(conds[0]), torch.from_numpy(conds[1]))
-			latents = (torch.from_numpy(latents[0]), torch.from_numpy(latents[1]))
-
-			wav_length = cfg.hdf5[key].attrs["wav_length"]
+			resps = torch.from_numpy(resps).to(torch.int16)
+			
+			"""
+			lang = metadata["language"] if "language" in metadata else None
+			tone = metadata["tone"] if "tone" in metadata else None
+			"""
 		else:
-			mel, metadata = _load_mels(path, return_metadata=True)
-			text = torch.tensor(metadata["text"]).to(self.text_dtype)
-			#conds = (torch.from_numpy(metadata["conds"][0]), torch.from_numpy(metadata["conds"][1]))
-			latents = (torch.from_numpy(metadata["latent"][0]), torch.from_numpy(metadata["latent"][1]))
-			wav_length = metadata["wav_length"]
+			resps, metadata = _load_artifact(path, return_metadata=True)
+			text = torch.tensor(tokenize( metadata["phonemes"] )).to(self.text_dtype)
+
+			"""
+			lang = metadata["language"] if "language" in metadata else None
+			tone = metadata["tone"] if "tone" in metadata else None
+			"""
+
+		return path, text, resps
+
+	# icky slop
+	def get_similar_utterance(self, speaker_name, utterance_name, offset=None ):
+		if offset is None:
+			offset = cfg.dataset.prompt_similar_top_k_offset
+
+		_, similars = self.metadata[speaker_name][utterance_name]
+
+		if not similars:
+			return None
+
+		if len(similars) >= offset:
+			offset = 0
+
+		# cringe stopgap
+		offset_end = offset + cfg.dataset.prompt_similar_top_k
+
+		if offset >= len( similars ):
+			return None
+		if offset_end >= len( similars ):
+			return None
+
+		utterance_keys = list(self.metadata[speaker_name].keys())
+		if cfg.dataset.prompt_similar_top_k > 1:
+			index = random.choice( similars[offset:offset_end] )
+		else:
+			index = similars[offset]
+
+		return utterance_keys[index]
+
+	def __getitem__(self, index):
+		self.current_index = index
+
+		"""
+		if self.empty_text is None:
+			self.empty_text = tokenize(" ")
+		
+		bos_id, space_id, eos_id = self.empty_text
+		"""
+
+		if self.sampler_type == "speaker":
+			speaker_id = index
+			speaker_name = self.speakers[speaker_id]
+			utterance_name = random.choice( list(self.metadata[speaker_name].keys()) ) # random.choice(self.metadata[speaker_name])
+		else:
+			(speaker_id, utterance_id), duration = self.paths[index]
+			speaker_name = self.speakers[speaker_id]
+			utterance_name = list(self.metadata[speaker_name].keys())[utterance_id]
+		
+		path = cfg.data_dir / speaker_name / utterance_name
+
+		"""
+		if cfg.dataset.use_hdf5:
+			key = _get_hdf5_path(path)
+
+			if key not in cfg.hdf5:
+				_logger.warning(f'Key of Path ({path}) not in HDF5: {key}')
+				return dict(path=None)
+
+			# cringe stopgap
+			if "text" not in cfg.hdf5[key] or "audio" not in cfg.hdf5[key]:
+				_logger.warning(f"text/audio not in entry: {key}")
+				return dict(path=None)
+
+			# I need to do some weird coersion to a normal dict because it'll bitch about Hdf5 objects not being pickleable in worker processes
+			metadata = { f'{k}': f'{v}' for k, v in cfg.hdf5[key].attrs.items() }
+
+			text = cfg.hdf5[key]["text"][:]
+			resps = cfg.hdf5[key]["audio"][:, :]
+			
+			text = torch.from_numpy(text).to(self.text_dtype)
+			resps = torch.from_numpy(resps).to(torch.int16)
+			
+			lang = metadata["language"] if "language" in metadata else None
+			tone = metadata["tone"] if "tone" in metadata else None
+			text_string = metadata["text"] if "text" in metadata else None
+
+			if cfg.dataset.retokenize_text and "text" in metadata:
+				text = torch.tensor(tokenize( metadata["text"] )).to(self.text_dtype)
+		else:
+			resps, metadata = _load_artifact(path, return_metadata=True)
+			text = torch.tensor(tokenize( metadata["text"] )).to(self.text_dtype)
+
+			lang = metadata["language"] if "language" in metadata else None
+			tone = metadata["tone"] if "tone" in metadata else None
+			text_string = metadata["text"] if "text" in metadata else None
 		"""
 
 		mel, artifact = _load_artifact(path, return_artifact=True)
 		text = torch.from_numpy( artifact["text"].astype(int) ).to(self.text_dtype)
-		#conds = (torch.from_numpy(artifact["conds"][0]), torch.from_numpy(artifact["conds"][1]))
+		"""
+		conds = (
+			torch.from_numpy(artifact["conds"][0].astype(float)).to(torch.float32),
+			torch.from_numpy(artifact["conds"][1].astype(float)).to(torch.float32),
+		)
+		"""
 		latents = (
 			torch.from_numpy(artifact["latent"][0].astype(float)).to(torch.float32),
 			torch.from_numpy(artifact["latent"][1].astype(float)).to(torch.float32)
@@ -561,8 +838,8 @@ class Dataset(_Dataset):
 		return dict(
 			index=index,
 			path=Path(path),
-			spkr_name=spkr_name,
-			spkr_id=spkr_id,
+			spkr_name=speaker_name,
+			spkr_id=speaker_id,
 
 			latents_0=latents[0][0],
 			latents_1=latents[1][0],
@@ -581,15 +858,22 @@ class Dataset(_Dataset):
 	def training_(self, value):
 		self.training = value
 
+	def index(self):
+		return (self.sampler.index() if self.sampler is not None else -1) // self.batch_size
+	
+	def batches(self):
+		if isinstance(self.sampler, BatchedOrderedSampler):
+			return len(self.sampler)
+		return len(self.sampler if self.sampler is not None else self) // self.batch_size
+
 	def __len__(self):
-		if self.sampler_type == "group":
-			return min(len(self.spkr_groups), self._head or len(self.spkr_groups))
 		if self.sampler_type == "speaker":
-			return min(len(self.spkrs), self._head or len(self.spkrs))
+			return min(len(self.speakers), self._head or len(self.speakers))
 		return min(len(self.paths), self._head or len(self.paths))
 
 
 def collate_fn(samples: list[dict]):
+	samples = [ s for s in samples if s["path"] is not None ]
 	batch: dict[str, Any] = {k: [s[k] for s in samples] for k in samples[0]}
 	return batch
 
@@ -601,17 +885,11 @@ def _seed_worker(worker_id):
 
 
 def _create_dataloader(dataset, training):
-	"""
-	if cfg.distributed and training:
-		sampler = DistributedSampler(dataset)
-		shuffle = False
-	"""		
-
 	kwargs = dict(
-		shuffle=dataset.shuffle,
+		shuffle=not training,
 		batch_size=cfg.hyperparameters.batch_size if training else cfg.evaluation.batch_size,
 		drop_last=training,
-		sampler=dataset.sampler,
+		sampler=dataset.sampler if training else None,
 	) if not isinstance(dataset.sampler, BatchedOrderedSampler) else dict(
 		batch_sampler=dataset.sampler,
 	)
@@ -621,7 +899,7 @@ def _create_dataloader(dataset, training):
 		num_workers=cfg.dataset.workers,
 		collate_fn=collate_fn,
 		persistent_workers=cfg.dataset.workers > 1,
-		pin_memory=False, # True,
+		pin_memory=True,
 		worker_init_fn=_seed_worker,
 		**kwargs,
 	)
@@ -632,75 +910,108 @@ def create_datasets():
 
 	return train_dataset, val_dataset
 
-
-def create_train_val_dataloader():
-	train_dataset, val_dataset = create_datasets()
-
-	# it'll cry about trying to pickle a torch._C_generator or something
-	try:
-		subtrain_dataset = copy.deepcopy(train_dataset)
-	except Exception as e:
-		subtrain_dataset = Dataset( training=True )
-
-	if subtrain_dataset.sampler_type == "path":
-		subtrain_dataset.head_(cfg.evaluation.size)
-
+def create_train_dataloader():
+	train_dataset = Dataset( training=True )
 	train_dl = _create_dataloader(train_dataset, training=True)
-	val_dl = _create_dataloader(val_dataset, training=False)
-	subtrain_dl = _create_dataloader(subtrain_dataset, training=False)
 
 	_logger.info(str(train_dataset.phone_symmap))
-	_logger.info(str(train_dataset.spkr_symmap))
-	_logger.info(str(train_dataset.spkr_group_symmap))
+	_logger.info(str(train_dataset.speaker_symmap))
+	
+	_logger.info(f"#samples (train): {len(train_dataset)}.")
+	_logger.info(f"#duration (train): {str(train_dataset.duration)}.")
+
+	# remove duration map (it gets bloated)
+	_durations_map = {}
+
+	return train_dl
+
+def create_val_dataloader():
+	val_dataset = Dataset( training=False )
+	val_dl = _create_dataloader(val_dataset, training=False)
+
+	_logger.info(str(val_dataset.phone_symmap))
+	_logger.info(str(val_dataset.speaker_symmap))
+	
+	_logger.info(f"#samples (val): {len(val_dataset)}.")
+	_logger.info(f"#duration (val): {str(val_dataset.duration)}.")
+
+	# remove duration map (it gets bloated)
+	_durations_map = {}
+
+	return val_dl
+
+# to-do, use the above two, then create the subtrain dataset
+def create_train_val_dataloader():
+	train_dataset, val_dataset = create_datasets()
+	train_dl = _create_dataloader(train_dataset, training=True)
+	val_dl = _create_dataloader(val_dataset, training=False)
+
+	_logger.info(str(train_dataset.phone_symmap))
+	_logger.info(f'#speakers (train): {len(train_dataset.speaker_symmap)}')
 
 	_logger.info(f"#samples (train): {len(train_dataset)}.")
 	_logger.info(f"#samples (val): {len(val_dataset)}.")
-	_logger.info(f"#samples (subtrain): {len(subtrain_dataset)}.")
 
 	_logger.info(f"#duration (train): {str(train_dataset.duration)}.")
 	_logger.info(f"#duration (val): {str(val_dataset.duration)}.")
-	_logger.info(f"#duration (subtrain): {str(subtrain_dataset.duration)}.")
 
-	assert isinstance(subtrain_dl.dataset, Dataset)
+	# remove duration map (it gets bloated)
+	_durations_map = {}
 
-	return train_dl, subtrain_dl, val_dl
+	return train_dl, val_dl
 
-def unpack_audio( npz ):
-	mel = torch.from_numpy(npz["codes"].astype(int)).to(dtype=torch.int16, device="cpu")
-	
-	conds = (
-		torch.from_numpy(npz["conds"][0].astype(float)).to(dtype=torch.float32, device="cpu"),
-		torch.from_numpy(npz["conds"][1].astype(float)).to(dtype=torch.float32, device="cpu"),
-	)
-
-	latent = (
-		torch.from_numpy(npz["latent"][0].astype(float)).to(dtype=torch.float32, device="cpu"),
-		torch.from_numpy(npz["latent"][1].astype(float)).to(dtype=torch.float32, device="cpu"),
-	)
-
+# parse metadata from an numpy file (.enc/.dac) and validate it
+def process_artifact_metadata( artifact ):
 	metadata = {}
 
-	if "text" in npz:
-		metadata["text"] = npz["text"]
-	
-	if "phonemes" in npz["metadata"]:
-		metadata["phonemes"] = npz["metadata"]["phonemes"]
-	
-	if "language" in npz["metadata"]:
-		metadata["language"] = npz["metadata"]["language"]
-	
-	if "original_length" in npz["metadata"]:
-		metadata["wav_length"] = npz["metadata"]["original_length"]
+	# text transcription (just in case)
+	if "text" in artifact["metadata"]:
+		metadata["text"] = artifact["metadata"]["text"]
+	# phonemization of text transcription (just in case)
+	if "phonemes" in artifact["metadata"]:
+		metadata["phonemes"] = artifact["metadata"]["phonemes"]
+	# language for sampling / input creation
+	if "language" in artifact["metadata"]:
+		metadata["language"] = artifact["metadata"]["language"]
+	# top-k similar utterances for this utternace
+	if "similar" in artifact["metadata"]:
+		metadata["similar"] = artifact["metadata"]["similar"]
+	# duration for use of culling / sorting dataset
+	if "duration" in artifact["metadata"]:
+		metadata["duration"] = float(artifact["metadata"]["duration"])
+	# derive duration from sample count / sample rate
+	elif "original_length" in artifact["metadata"] and "sample_rate" in artifact["metadata"]:
+		metadata["duration"] = artifact["metadata"]["original_length"] / artifact["metadata"]["sample_rate"]
 
-	if "duration" in npz["metadata"]:
-		metadata["duration"] = npz["metadata"]["duration"]
-	elif "original_length" in npz["metadata"] and "sample_rate" in npz["metadata"]:
-		metadata["duration"] = npz["metadata"]["original_length"] / npz["metadata"]["sample_rate"]
+	"""
+	# rephonemize if required
+	if "phonemes" not in metadata and "text" in metadata:
+		metadata["phonemes"] = encode_phns( metadata["text"], language=metadata["language"] if "language" in metadata["language"] else "en" )
 
-	return mel, conds, latent, metadata
+	# clean up phonemes from espeak
+	#     for example: Sonnenküste Update => zˈɔnənkˌystə (en)ˈʌpdeɪt(de)
+	# to-do: regex replace /([a-z]{2})/ to ""
+	if "phonemes" in metadata:
+		metadata["phonemes"] = metadata["phonemes"].replace("(en)", "")
+		if "language" in metadata:
+			metadata["phonemes"] = metadata["phonemes"].replace(f"({metadata['language']})", "")
+		metadata["phonemes"] = re.sub(r'\([a-z]{2}\)', "", metadata["phonemes"])
+	"""
+
+	return metadata
+
+# yucky, but I would like to have the LibriTTS-R utterances remapped to their LibriSpeech counterpart
+# to-do: allow this to be adjusted without having to regenerate metadata / HDF5 by remapping name during dataloader creation
+def remap_speaker_name( name ):
+	# commented out because I don't want the LibriSpeech portion of the dataset to get added
+	"""
+	if "LibriTTS-R" in speaker_name:
+		name = name.replace("LibriTTS-R", "LibriVox")
+	"""
+	return name
 
 # parse dataset into better to sample metadata
-def create_dataset_metadata( skip_existing=True ):
+def create_dataset_metadata( skip_existing=False ):
 	symmap = get_phone_symmap()
 	
 	root = str(cfg.data_dir)
@@ -711,49 +1022,46 @@ def create_dataset_metadata( skip_existing=True ):
 	def add( dir, type="training", audios=True, texts=True ):
 		name = str(dir)
 		name = name.replace(root, "")
-
-		speaker_name = name
+		speaker_name = remap_speaker_name( name )
 
 		metadata_path = Path(f"{metadata_root}/{speaker_name}.json")
 		metadata_path.parents[0].mkdir(parents=True, exist_ok=True)
 
-		try:
-			metadata = {} if not metadata_path.exists() else json.loads(open(str(metadata_path), "r", encoding="utf-8").read())
-		except Exception as e:
-			metadata = {}
+		metadata = json_read( metadata_path, default={} )
 
 		if not os.path.isdir(f'{root}/{name}/'):
 			return
-		# tqdm.write(f'{root}/{name}')
+
 		files = os.listdir(f'{root}/{name}/')
 
 		# grab IDs for every file
-		ids = { file.replace(_get_mel_extension(), "").replace(_get_phone_extension(), "") for file in files }
+		ids = { file.replace(_get_artifact_extension(), "").replace(_get_metadata_extension(), "") for file in files }
 
-		for id in tqdm(ids, desc=f"Processing {name}"):
+		wrote = False
+
+		for id in tqdm(ids, desc=f"Processing {name}", disable=True):
 			try:
-				mel_exists = os.path.exists(f'{root}/{name}/{id}{_get_mel_extension()}') if audios else True
-				text_exists = os.path.exists(f'{root}/{name}/{id}{_get_phone_extension()}') if texts else True
+				quant_path = Path(f'{root}/{name}/{id}{_get_artifact_extension()}')
 
-				if not mel_exists:
+				if audios and not quant_path.exists():
 					continue
 
 				key = f'{type}/{speaker_name}/{id}'
 
 				if skip_existing and id in metadata:
 					continue
+				
+				wrote = True
 
 				if id not in metadata:
 					metadata[id] = {}
 
 				utterance_metadata = {}
 				if audios:
-					# ideally we'll encode Encodec-based audio in a similar manner because np has smaller files than pt
-					npz = np.load(f'{root}/{name}/{id}{_get_mel_extension()}', allow_pickle=True)[()]
-					mel, conds, latents, utterance_metadata = unpack_audio( npz )
-				# text
-				if texts and text_exists and not utterance_metadata:
-					utterance_metadata = json.loads(open(f'{root}/{name}/{id}{_get_phone_extension()}', "r", encoding="utf-8").read())
+					qnt, artifact = _load_artifact(quant_path, return_artifact=True)
+					utterance_metadata = process_artifact_metadata( artifact )
+					# to-do: derive duration from codes if duration is malformed because this happened to me with LibriTTS-R
+					#utterance_metadata["duration"] = qnt.shape[0] / cfg.dataset.frames_per_second
 
 				for k, v in utterance_metadata.items():
 					metadata[id][k] = v
@@ -761,8 +1069,8 @@ def create_dataset_metadata( skip_existing=True ):
 			except Exception as e:
 				tqdm.write(f'Error while processing {id}: {e}')
 
-		with open(str(metadata_path), "w", encoding="utf-8") as f:
-			f.write( json.dumps( metadata ) )
+		if wrote:
+			json_write( metadata, metadata_path )
 
 	# training
 	for data_dir in tqdm(sorted(cfg.dataset.training), desc="Processing Training"):
@@ -788,19 +1096,19 @@ def create_dataset_hdf5( skip_existing=True ):
 	metadata_root = str(cfg.metadata_dir)
 
 
-	def add( dir, type="training", audios=True, texts=True ):
+	def add( dir, type="training", audios=True, texts=True, verbose=False ):
 		name = str(dir)
 		name = name.replace(root, "")
-		
-		# yucky
-		speaker_name = name
-		if "LibriTTS-R" in speaker_name:
-			speaker_name = speaker_name.replace("LibriTTS-R", "LibriVox")
+		speaker_name = remap_speaker_name( name )
 
 		metadata_path = Path(f"{metadata_root}/{speaker_name}.json")
 		metadata_path.parents[0].mkdir(parents=True, exist_ok=True)
 
-		metadata = {} if not metadata_path.exists() else json.loads(open(str(metadata_path), "r", encoding="utf-8").read())
+		try:
+			metadata = json_read(metadata_path, default={})
+		except Exception as e:
+			print(metadata_path, e)
+			return
 
 		if not os.path.isdir(f'{root}/{name}/'):
 			return
@@ -808,14 +1116,38 @@ def create_dataset_hdf5( skip_existing=True ):
 		files = os.listdir(f'{root}/{name}/')
 
 		# grab IDs for every file
-		ids = { file.replace(_get_mel_extension(), "").replace(_get_phone_extension(), "") for file in files }
+		ids = { file.replace(_get_artifact_extension(), "").replace(_get_metadata_extension(), "") for file in files }
 
-		for id in tqdm(ids, desc=f"Processing {name}"):
+		"""
+		# rephonemizes if you fuck up and use and old tokenizer...
+		for id, entry in tqdm(metadata.items(), desc=f"Processing {name}"):
+			key = f'{type}/{speaker_name}/{id}'
+
+			if key not in hf:
+				continue
+			
+			group = hf[key]
+
+			if "phonemes" not in entry:
+				continue
+			if "text" not in group:
+				continue
+
+			txt = entry["phonemes"]
+			phn = "".join(txt)
+			phn = cfg.tokenizer.encode(phn)
+			phn = np.array(phn).astype(np.uint8) 
+
+			del group["text"]
+			group.create_dataset('text', data=phn, compression='lzf')
+		"""
+
+		for id in tqdm(ids, desc=f"Processing {name}", disable=not verbose):
 			try:
-				mel_exists = os.path.exists(f'{root}/{name}/{id}{_get_mel_extension()}') if audios else True
-				text_exists = os.path.exists(f'{root}/{name}/{id}{_get_phone_extension()}') if texts else True
+				quant_exists = os.path.exists(f'{root}/{name}/{id}{_get_artifact_extension()}') if audios else True
+				text_exists = os.path.exists(f'{root}/{name}/{id}{_get_metadata_extension()}') if texts else True
 
-				if not mel_exists:
+				if not quant_exists:
 					continue
 
 				key = f'{type}/{speaker_name}/{id}'
@@ -832,26 +1164,18 @@ def create_dataset_hdf5( skip_existing=True ):
 
 				# audio
 				if audios:
-					npz = np.load(f'{root}/{name}/{id}{_get_mel_extension()}', allow_pickle=True)[()]
-					mel, conds, latents, utterance_metadata = unpack_audio( npz )
+					qnt, artifact = _load_artifact(f'{root}/{name}/{id}{_get_artifact_extension()}', return_artifact=True)
+					utterance_metadata = process_artifact_metadata( artifact )
 
 					if "audio" not in group:
-						group.create_dataset('audio', data=mel.numpy(), compression='lzf')
-					
-					"""
-					for i, cond in enumerate(conds):
-						if f"conds_{i}" not in group:
-							group.create_dataset(f'conds_{i}', data=cond.numpy(), compression='lzf')
-					"""
-						
-					for i, latent in enumerate(latents):
-						if f"latents_{i}" not in group:
-							group.create_dataset(f'latents_{i}', data=latent.numpy(), compression='lzf')
+						group.create_dataset('audio', data=qnt.numpy().astype(np.int16), compression='lzf')
 
 				# text
+				# this is a relic from when I did have the quantized audio and phoneme transcription separate
+				# to-do: ensure I can remove this block
 				if texts:
 					if not utterance_metadata and text_exists:
-						utterance_metadata = json.loads(open(f'{root}/{name}/{id}{_get_phone_extension()}', "r", encoding="utf-8").read())
+						utterance_metadata = json_read(f'{root}/{name}/{id}{_get_metadata_extension()}')
 
 					phn = "".join(utterance_metadata["text"])
 					phn = cfg.tokenizer.encode(phn)
@@ -866,10 +1190,8 @@ def create_dataset_hdf5( skip_existing=True ):
 
 			except Exception as e:
 				tqdm.write(f'Error while processing {id}: {e}')
-				raise e
 
-		with open(str(metadata_path), "w", encoding="utf-8") as f:
-			f.write( json.dumps( metadata ) )
+		json_write( metadata, metadata_path )
 
 	# training
 	for data_dir in tqdm(cfg.dataset.training, desc="Processing Training"):
@@ -887,7 +1209,7 @@ def create_dataset_hdf5( skip_existing=True ):
 	if "symmap" in hf:
 		del hf['symmap']
 
-	hf.create_dataset('symmap', data=json.dumps(symmap))
+	hf.create_dataset('symmap', data=json_stringify(symmap))
 	hf.close()
 
 if __name__ == "__main__":
@@ -900,13 +1222,8 @@ if __name__ == "__main__":
 
 	task = args.action
 
+	setup_logging()
 	cfg.dataset.workers = 1
-
-	class LoggerOveride:
-		def info(self, *args):
-			print(*args)
-	
-	_logger = LoggerOveride()
 
 	if args.action == "hdf5":
 		create_dataset_hdf5()
@@ -918,47 +1235,115 @@ if __name__ == "__main__":
 					continue
 				dataset.append(f'{group}/{name}')
 
-		print(json.dumps(dataset))
+		_logger.info(json_stringify(dataset))
 	elif args.action == "metadata":
 		create_dataset_metadata()
 	elif args.action == "sample":
-		train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
+		train_dl, val_dl = create_train_val_dataloader()
 
 		samples = {
-			"training": next(iter(train_dl)),
-			#"evaluation": next(iter(subtrain_dl)),
-			#"validation": next(iter(val_dl)),
+			"training": [ next(iter(train_dl)),  next(iter(train_dl)) ],
+			"validation": [ next(iter(val_dl)),  next(iter(val_dl)) ],
 		}
 
-		for sample_name, sample_batch in samples.items():
-			for name, batch in sample_batch.items():
-				#print( name, [ x.shape if hasattr(x, "shape") else x for x in batch ] )
-				print( name, [ x for x in batch ] )
-		
-		"""
+		Path("./data/sample-test/").mkdir(parents=True, exist_ok=True)
+
 		for k, v in samples.items():
 			for i in range(len(v)):
-				print(f'{k}[{i}]:', v[i])
-		"""
+				for j in tqdm(range(len(v[i]['proms'])), desc="Decoding..."):
+					"""
+					"""
+					try:
+						decode_to_file( v[i]['proms'][j], f"./data/sample-test/{k}.{i}.{j}.proms.wav", device="cpu" )
+					except Exception as e:
+						_logger.info(f"Error while decoding prom {k}.{i}.{j}.wav: {str(e)}")
+					try:
+						decode_to_file( v[i]['resps'][j], f"./data/sample-test/{k}.{i}.{j}.resps.wav", device="cpu" )
+					except Exception as e:
+						_logger.info(f"Error while decoding resp {k}.{i}.{j}.wav: {str(e)}")
+					#v[i]['proms'][j] = v[i]['proms'][j].shape
+					#v[i]['resps'][j] = v[i]['resps'][j].shape
+		
+		for k, v in samples.items():
+			for i in range(len(v)):
+				_logger.info(f'{k}[{i}]: {v[i]}')
+	elif args.action == "validate":
+		train_dl, val_dl = create_train_val_dataloader()
+		dataset = train_dl.dataset
+
+		missing = []
+		symmap = get_phone_symmap()
+
+		for index in tqdm(range(len( dataset )), desc="Processing dataset..."):
+			if dataset.sampler_type == "speaker":
+				speaker_id = index
+				speaker_name = dataset.speakers[speaker_id]
+				utterance_name = random.choice( list(dataset.metadata[speaker_name].keys()) ) # random.choice(dataset.metadata[speaker_name])
+			else:
+				speaker_id, utterance_id = dataset.paths[index]
+				speaker_name = dataset.speakers[speaker_id]
+				speaker_keys = list(dataset.metadata[speaker_name].keys())
+				utterance_name = speaker_keys[utterance_id]
+
+			path = cfg.data_dir / speaker_name / utterance_name
+
+			if cfg.dataset.use_hdf5:
+				key = _get_hdf5_path(path)
+				if key not in cfg.hdf5:
+					continue
+				metadata = { f'{k}': f'{v}' for k, v in cfg.hdf5[key].attrs.items() }
+			else:
+				_, metadata = _load_artifact(path, return_metadata=True)
+			
+			phonemes = metadata["phonemes"]
+
+			for i, phone in enumerate( phonemes ):
+				if phone in symmap:
+					continue
+				if phone in missing:
+					continue
+
+				_logger.info( f"{path} | {phonemes}[{i}] | {phone}" )
+				missing.append( phone )
+
+			"""
+			text = tokenize( phonemes )[1:-1]
+			unk_token = tokenize("<unk>")[1]
+
+			if unk_token in text:
+				print( unk_token, text, phonemes )
+
+			for i, token in enumerate(text):
+				if token != unk_token:
+					continue
+				
+				phone = phonemes[i]
+				if phone not in missing:
+					_logger.info( f"{path} | {phonemes}[{i}] | {phone}" )
+				missing |= set([phone])
+			"""
+
+		_logger.info( f"Missing tokens: {missing}" )
+
 
 	elif args.action == "tasks":
 		index = 0
 		cfg.dataset.tasks_list = args.tasks.split(",")
 		
-		train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
+		train_dl, val_dl = create_train_val_dataloader()
 		batch = next(iter(train_dl))
 
 		for text, resps, proms, task in zip(batch["text"], batch["resps"], batch["proms"], batch["task"]):
 			if task not in cfg.dataset.tasks_list:
 				continue
 
-			print(text, task, cfg.model.prom_levels)
-			print( proms.shape, resps.shape )
+			_logger.info( f'{text} {task} {cfg.model.resp_levels}')
+			_logger.info( f'{proms.shape} {resps.shape}' )
 
 			tokens = 0
 			tokens += sum([ text.shape[0] for text in batch["text"] ])
 			tokens += sum([ resps.shape[0] for resps in batch["resps"] ])
-			print( tokens )
+			_logger.info( f'{tokens}' )
 
 			decode_to_file( proms, f"./data/{task}.proms.wav", device="cpu" )
 			decode_to_file( resps, f"./data/{task}.resps.wav", device="cpu" )

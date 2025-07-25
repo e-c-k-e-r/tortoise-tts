@@ -19,8 +19,10 @@ from tqdm import tqdm
 from typing import Protocol
 
 from ..config import cfg
-from .distributed import init_distributed, distributed_initialized, world_size
 from .distributed import (
+	init_distributed,
+	distributed_initialized,
+	world_size,
 	global_leader_only,
 	global_rank,
 	is_global_leader,
@@ -31,7 +33,7 @@ from .distributed import (
 from ..engines import Engine, Engines, TrainFeeder, default_feeder, load_engines
 
 from .utils import to_device, do_gc, truncate_json
-from ..utils import wrapper as ml
+from ..utils import ml
 from ..data import get_phone_symmap # should decouple from this trainer script
 
 _logger = logging.getLogger(__name__)
@@ -100,10 +102,22 @@ def _non_blocking_input():
 
 
 def _make_infinite_epochs(dl):
-	while True:
-		#_logger.info("New epoch starts.")
-		yield from tqdm(dl, "Epoch progress", dynamic_ncols=True, disable=not is_global_leader())
+	if dl.dataset.batches() == 0:
+		raise Exception("Empty dataset!")
 
+	while True:
+		if dl.dataset.index() == 0:
+			_logger.info("New epoch starts.")
+		
+		with tqdm(dl, "Epoch progress", dynamic_ncols=True, disable=not is_global_leader()) as pbar:
+			yield from pbar
+
+		"""
+		# this breaks the bar on a new epoch...
+		total = dl.dataset.batches() - dl.dataset.index()
+		with tqdm(dl, "Epoch progress", dynamic_ncols=True, disable=not is_global_leader(), total=total) as pbar:
+			yield from pbar
+		"""
 
 @local_leader_only(default=None)
 def logger(data):
@@ -116,7 +130,6 @@ def seed(seed):
 	np.random.seed(seed + global_rank())
 	torch.manual_seed(seed + global_rank())
 
-
 def train(
 	train_dl: DataLoader,
 	train_feeder: TrainFeeder = default_feeder,
@@ -124,6 +137,15 @@ def train(
 	logger: Logger = logger,
 ):
 	engines = load_engines()
+
+	# validate if there's at least one model to train
+	found = False
+	for name, engine in engines.items():
+		if engine._training:
+			found = True
+			break
+	if not found:
+		raise Exception('Training, but no model loaded set to train...')
 
 	"""
 	if is_local_leader():
@@ -141,6 +163,7 @@ def train(
 		eval_fn(engines=engines)
 
 	if command in ["quit", "eval_quit"]:
+		engines.quit()
 		return
 
 	last_save_step = engines.global_step
@@ -157,7 +180,9 @@ def train(
 			break
 
 		#batch = to_device(batch, torch.cuda.current_device())
-		stats = engines.step(batch=batch, feeder=train_feeder)
+		with torch.autograd.set_detect_anomaly(cfg.trainer.detect_grad_anomaly):
+			stats = engines.step(batch=batch, feeder=train_feeder)
+
 		stats['epoch'] = engines.global_samples / (len(train_dl.dataset.paths) * world_size())
 
 		elapsed_time = stats.get("elapsed_time", 0)
@@ -166,10 +191,7 @@ def train(
 		except Exception as e:
 			metrics = str(stats)
 
-		if cfg.trainer.no_logger:
-			tqdm.write(f"Training Metrics: {truncate_json(metrics)}.")
-		else:
-			_logger.info(f"Training Metrics: {truncate_json(metrics)}.")
+		_logger.info(f"Training Metrics: {truncate_json(metrics)}.")
 
 		command = _non_blocking_input()
 
@@ -209,9 +231,18 @@ def train(
 				rate = float(command.split(" ")[-1])
 				try:
 					engines.set_lr(rate)
-					print("Updating LR to:", rate)
+					_logger.info(f"Updating LR to: {rate}")
 				except Exception as e:
-					print("Failed to set LR rate to:", rate, str(e))
+					_logger.warning(f"Failed to set LR to: {rate}, {str(e)}")
+
+			if "loss_scale" in command:
+				value = float(command.split(" ")[-1])
+				try:
+					engines.set_loss_scale(value)
+					_logger.info(f"Updating loss scale to: {value}")
+				except Exception as e:
+					raise e
+					_logger.warning(f"Failed to set loss scale to: {value}, {str(e)}")
 
 			if "export" in command:
 				train_dl.dataset.save_state_dict()
@@ -219,7 +250,10 @@ def train(
 				last_save_step = engines.global_step
 
 				if is_global_leader():
-					engines.export(userdata={"symmap": get_phone_symmap()})
+					if cfg.lora is not None:
+						_logger.warning(f"Exporting LoRA during training not properly implemented, please use the export module explicitly.")
+					else:
+						engines.export(userdata={"symmap": get_phone_symmap()})
 
 			save_ckpt_every = cfg.trainer.save_frequency or cfg.evaluation.frequency
 
@@ -242,7 +276,11 @@ def train(
 					last_save_step = engines.global_step
 					
 					if command in export_commands and is_global_leader():
-						engines.export(userdata={"symmap": get_phone_symmap()})
+						# to-do: actually export the state properly
+						if cfg.lora is not None:
+							_logger.warning(f"Exporting LoRA during training not properly implemented, please use the export module explicitly.")
+						else:
+							engines.export(userdata={"symmap": get_phone_symmap()})
 
 			if engines.global_step != last_eval_step:
 				if engines.global_step % cfg.evaluation.frequency == 0 or command in ["eval"]:
@@ -250,4 +288,5 @@ def train(
 					eval_fn(engines=engines)
 
 			if command in ["quit"]:
+				engines.quit()
 				return

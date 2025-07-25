@@ -5,16 +5,21 @@ import random
 import torch
 from torch.utils.data import Sampler
 
+from .distributed import global_rank, local_rank, world_size
+
 # Randomly picks an index from an array of indices
 class PoolSampler():
-	def __init__( self, pool = [], keep_all = False ):
+	def __init__( self, pool = [], keep_all = False, shuffle = False ):
 		self.length = len(pool)
+		self.shuffle = shuffle
 		self.global_pool = pool if keep_all else None
 		self.global_indices = [ i for i in range(self.length) ]
 		self.reset()
 
 	def reset(self):
 		self.current_pool = [ i for i in self.global_indices ]
+		if self.shuffle:
+			random.shuffle(self.current_pool)
 
 	def sample(self, pool = None):
 		if pool is None:
@@ -38,6 +43,9 @@ class PoolSampler():
 
 	def __call__(self, *args, **kwargs):
 		return self.sample(*args, **kwargs)
+
+	def index(self):
+		return len(self.global_indices) - len(self.current_pool)
 
 	def get_state(self):
 		return { "length": self.length, "global_pool": self.global_pool, "global_indices": self.global_indices, "current_pool": self.current_pool }
@@ -67,6 +75,9 @@ class OrderedSampler(Sampler):
 			yield self.position
 			self.position += 1
 
+	def index(self):
+		return self.position
+
 	def get_state(self):
 		return { "position": self.position, "length": self.length }
 	
@@ -76,20 +87,22 @@ class OrderedSampler(Sampler):
 
 # Like the above, but will batch based on token count
 class BatchedOrderedSampler(Sampler):
-	def __init__( self, buckets, max_duration=0, max_batch_size=0 ):
+	def __init__( self, buckets, max_duration=0, max_batch_size=0, shuffle=False, drop_last=True, use_max_size=True ):
 		self.position = 0
 		self.batches = []
+		self.shuffle = shuffle
 
 		assert max_duration != 0 and max_batch_size != 0, "max_duration and max_batch_size cannot both be 0"
 
 		current_batch = []
-		current_size = 0
 		current_index = 0
+		current_duration = 0
+
 		for key, bucket in buckets.items():
 			for path, duration in bucket:
 				# flush
 				should_flush = False
-				if max_duration > 0 and current_size + duration > max_duration:
+				if max_duration > 0 and current_duration + duration > max_duration:
 					should_flush = True
 				elif max_batch_size > 0 and len(current_batch) >= max_batch_size:
 					should_flush = True
@@ -97,11 +110,21 @@ class BatchedOrderedSampler(Sampler):
 				if should_flush and len(current_batch) > 0:
 					self.batches.append( current_batch )
 					current_batch = []
-					current_size = 0
+					current_duration = 0
 				
 				current_batch.append( current_index )
 				current_index += 1
-				current_size += duration
+				# as long as durations are ordered, this assertion is always true
+				if use_max_size:
+					current_duration = duration * len(current_batch)
+				else:
+					current_duration += duration
+
+		if not drop_last and current_batch:
+			self.batches.append( current_batch )
+
+		if self.shuffle:
+			random.shuffle(self.batches)
 
 	def __len__(self):
 		return len(self.batches)
@@ -109,10 +132,15 @@ class BatchedOrderedSampler(Sampler):
 	def __iter__(self):
 		if self.position >= len(self.batches):
 			self.position = 0
+			if self.shuffle:
+				random.shuffle(self.batches)
 
 		while self.position < len(self.batches):
 			yield self.batches[self.position]
 			self.position += 1
+
+	def index(self):
+		return self.position
 
 	def get_state(self):
 		return { "position": self.position, "batches": self.batches }
@@ -142,6 +170,9 @@ class RandomSampler(Sampler):
 		while self.position < self.length:
 			yield self.perm[self.position]
 			self.position += 1
+
+	def index(self):
+		return self.position
 
 	def get_state(self):
 		return { "position": self.position, "length": self.length, "perm": self.perm, "generator": self.generator.get_state() }

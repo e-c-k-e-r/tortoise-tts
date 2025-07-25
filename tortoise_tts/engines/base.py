@@ -28,7 +28,8 @@ def default_feeder(engine, batch):
 
 from ..config import cfg
 from ..utils import dispatch_attribute, flatten_dict, gather_attribute, do_gc, to_device
-from ..utils.distributed import init_distributed, distributed_initialized, is_global_leader, world_size
+from ..utils.distributed import init_distributed, distributed_initialized, is_global_leader, world_size, cleanup_distributed
+from ..utils.io import torch_save, torch_load
 from ..models.lora import freeze_non_lora_weights, lora_get_state_dict, lora_load_state_dict
 
 import logging
@@ -36,6 +37,7 @@ import time
 import torch
 import torch.distributed
 import os
+import re
 
 from torch import Tensor
 from torch.distributed import all_reduce
@@ -43,12 +45,16 @@ from typing import Any, Protocol
 from functools import cached_property
 
 from .base import TrainFeeder
-from ..utils import wrapper as ml
+from ..utils import ml
 
 _logger = logging.getLogger(__name__)
 
-if not distributed_initialized() and cfg.trainer.backend == "local": # and world_size() > 1:
-	init_distributed(torch.distributed.init_process_group)
+# windows throws an error here
+try:
+	if not distributed_initialized() and cfg.trainer.backend == "local": # and world_size() > 1:
+		init_distributed(torch.distributed.init_process_group)
+except Exception as e:
+	pass
 
 # A very naive engine implementation using barebones PyTorch
 class Engine():
@@ -58,19 +64,20 @@ class Engine():
 			kwargs.pop("hyper_config")
 
 		self.module = kwargs['model'].to(cfg.device).to(torch.float32 if cfg.trainer.amp else cfg.trainer.dtype)
-		self.optimizer = kwargs['optimizer'] if 'optimizer' in kwargs else None
-		self.lr_scheduler = kwargs['lr_scheduler'] if 'lr_scheduler' in kwargs else None
-
-		self.global_steps = kwargs.pop("global_steps", 0)
-		self.micro_steps = kwargs.pop("micro_steps", 0)
-		self.global_samples = kwargs.pop("global_samples", 0)
-		self.tokens_processed = kwargs.pop("tokens_processed", 0)
-
-		self._frozen_params = set()
-
-		self.max_nan_losses = 8
+		self.optimizer = kwargs.get('optimizer', None)
+		self.lr_scheduler = kwargs.get('lr_scheduler', None)
 		self.loss_scaler = torch.cuda.amp.GradScaler() if cfg.trainer.scale_loss else None
 
+		stats = kwargs.get("stats", {})
+		if stats is None:
+			stats = {}
+		
+		self.global_steps = stats.get("global_step", 0)
+		self.micro_steps = stats.get("micro_step", 0)
+		self.global_samples = stats.get("global_samples", 0)
+		self.tokens_processed = stats.get("tokens_processed", 0)
+
+		self._frozen_params = set()
 		self.current_batch_size = 0
 		self._global_grad_norm = None
 
@@ -98,6 +105,12 @@ class Engine():
 		if not hasattr(self, "hyper_config"):
 			return True
 		return self.hyper_config.training
+
+	@property
+	def _teacher(self):
+		if not hasattr(self, "hyper_config"):
+			return False
+		return self.hyper_config.teacher
 
 	@property
 	def global_step(self):
@@ -129,22 +142,15 @@ class Engine():
 		if is_global_leader():
 			module = self.module.state_dict()
 
-			# if training lora
-			# this is a separate path to override saving the weights
-			lora = None
 			if cfg.lora is not None:
-				lora, module = lora_get_state_dict( module, split = True )
 				save_dir = cfg.ckpt_dir / cfg.lora.full_name
 
-			save_path = save_dir / tag / "state.pth"
+			save_path = save_dir / tag / f"state.{cfg.weights_format}"
+			save_path_optimizer = save_dir / tag / f"optimizer.pth"
 			save_path.parent.mkdir(parents=True, exist_ok=True)
 
-			torch.save({
+			torch_save({
 				"module": module,
-				"lora": lora,
-				"optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
-				"lr_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
-				
 				"stats": {		
 					"global_step": self.global_step,
 					"micro_step": self.micro_step,
@@ -152,6 +158,11 @@ class Engine():
 					"tokens_processed": self.tokens_processed,
 				}
 			}, save_path)
+
+			torch_save({
+				"optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
+				"lr_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
+			}, save_path_optimizer )
 
 			open(save_dir / "latest", 'w').write( tag )
 
@@ -170,12 +181,13 @@ class Engine():
 
 			tag = open(tag_path).read()
 
-		load_path = load_dir / tag / "state.pth"
+		load_path = load_dir / tag / f"state.{cfg.weights_format}"
+		load_path_optimizer = load_dir / tag / f"optimizer.pth"
 
 		if not load_path.exists():
 			return
-
-		state = torch.load(load_path, map_location=torch.device(cfg.device))
+		
+		state = torch_load(load_path, device=cfg.device)
 
 		self.global_steps = state['stats']['global_step'] if 'stats' in state else state['global_step']
 		self.micro_steps = state['stats']['micro_step'] if 'stats' in state else state['micro_step']
@@ -183,16 +195,21 @@ class Engine():
 		self.tokens_processed = state['stats']['tokens_processed'] if 'stats' in state else state['tokens_processed']
 		self.module.load_state_dict(state['module'], strict=cfg.trainer.strict_loading)
 
+		if "optimizer" not in state and load_path_optimizer.exists():
+			optimizer_state = torch_load(load_path_optimizer, device=cfg.device)
+			state["optimizer"] = optimizer_state["optimizer"] if "optimizer" in optimizer_state else None
+			state["lr_scheduler"] = optimizer_state["lr_scheduler"] if "lr_scheduler" in optimizer_state else None
+
 		load_optimizer_states = load_optimizer_states and self.optimizer is not None and 'optimizer' in state
 		load_lr_scheduler_states = load_lr_scheduler_states and self.lr_scheduler is not None and 'lr_scheduler' in state
 		
 		if load_optimizer_states:
-			self.optimizer.load_state_dict(state['optimizer']) #, map_location=torch.device(cfg.device))
+			self.optimizer.load_state_dict(state['optimizer']) #, device=cfg.device)
 		
 		if load_lr_scheduler_states:
-			self.lr_scheduler.load_state_dict(state['lr_scheduler']) #, map_location=torch.device(cfg.device))
+			self.lr_scheduler.load_state_dict(state['lr_scheduler']) #, device=cfg.device)
 
-		if 'lora' in state:
+		if 'lora' in state and state['lora'] is not None:
 			lora_load_state_dict( self.module, state['lora'] )
 
 	def eval(self):
@@ -230,7 +247,7 @@ class Engine():
 			self.global_samples += self.batch_size
 
 			if (self.micro_steps + 1) % max(1, self.gradient_accumulation_steps) == 0:
-				torch.nn.utils.clip_grad_norm_(self.module.parameters(), self.gradient_clipping)
+				self._global_grad_norm = torch.nn.utils.clip_grad_norm_(self.module.parameters(), self.gradient_clipping)
 
 				self.global_steps += 1 
 				if self.loss_scaler is not None:
@@ -238,10 +255,13 @@ class Engine():
 					self.loss_scaler.update()
 				else:
 					self.optimizer.step()
+				
+				if self.lr_scheduler is not None:
+					self.lr_scheduler.step()
+				
 				self.optimizer.zero_grad()
-
-				self._get_grad_norm()
 	
+	# doesn't actually work
 	def _get_grad_norm(self):
 		t = [ param.grad.detach().flatten() for param in self.module.parameters() if param.grad is not None ]
 		self._global_grad_norm = torch.cat(t).norm().item() if len(t) else None
@@ -262,6 +282,20 @@ class Engine():
 			elif 'lr' in param_group:
 				param_group['lr'] = lr
 
+	def get_loss_scale(self):
+		if not hasattr(self, "loss_scaler") or self.loss_scaler is None:
+			return 1
+
+		return self.loss_scaler.get_scale()
+
+	def set_loss_scale(self, value):
+		if not hasattr(self, "loss_scaler") or self.loss_scaler is None:
+			return
+		
+		"""
+		self.optimizer.loss_scale = value
+		"""
+
 	def get_global_grad_norm(self):
 		return self._global_grad_norm
 
@@ -271,11 +305,6 @@ class Engine():
 		
 		losses = self.gather_attribute("loss")
 		loss = torch.stack([*losses.values()]).sum()
-
-		if torch.isnan(loss).any():
-			self.max_nan_losses = self.max_nan_losses - 1
-			if self.max_nan_losses < 0:
-				raise RuntimeError("Too many NaN losses detected.")
 
 		stats = {}
 		stats |= {k: v.item() for k, v in losses.items()}
@@ -324,17 +353,19 @@ class Engines(dict[str, Engine]):
 		for engine in self.values():
 			engine.dispatch_attribute(*args, **kwargs)
 
-	def export(self, userdata={}, callback=None, dtype=None):
+	def export(self, userdata={}, callback=None, dtype=None, format=None):
+		if not format:
+			format = cfg.weights_format
+		format = format.lower()
+
 		if dtype is None:
 			dtype = cfg.trainer.dtype
 
 		for name, engine in self.items():
 			module = engine.module.state_dict()
 			lora = None
-			save_path = cfg.ckpt_dir / name / "fp32.pth"
+			save_path = cfg.ckpt_dir / name / f"{cfg.weights_name}.{format}"
 			config = engine.module.config if hasattr(engine.module, "config") else engine.hyper_config
-			if not isinstance(config, dict):
-				config = config.__dict__
 
 			# safety
 			for k, v in module.items():
@@ -342,7 +373,10 @@ class Engines(dict[str, Engine]):
 
 			if cfg.lora is not None:				
 				lora, module = lora_get_state_dict( module, split = True )
-				save_path = cfg.ckpt_dir / cfg.lora.full_name / "fp32.pth"
+				save_path = cfg.ckpt_dir / cfg.lora.full_name / f"{cfg.weights_name}.{format}"
+
+			config_dict = dict(**config.__dict__)
+			config_dict |= {"experimental": config.experimental.__dict__}
 
 			state_dict = {
 				'module': module,
@@ -354,7 +388,7 @@ class Engines(dict[str, Engine]):
 					"tokens_processed": engine.tokens_processed,
 				},
 				"userdata": userdata,
-				"config": config
+				"config": config_dict
 			}
 
 			if lora is None:
@@ -363,8 +397,8 @@ class Engines(dict[str, Engine]):
 			if callback:
 				state_dict = callback( state_dict, config = engine.hyper_config, save_path = save_path )
 
-			torch.save(state_dict, save_path)
-			print(f"Exported {name} to {save_path}")
+			torch_save(state_dict, save_path)
+			_logger.info(f"Exported {name} to {save_path}")
 
 	def save_checkpoint(self, tag=None):
 		if not tag:
@@ -379,10 +413,17 @@ class Engines(dict[str, Engine]):
 				continue
 
 			save_dir = cfg.ckpt_dir / name
+			if cfg.lora is not None:
+				save_dir = cfg.ckpt_dir / cfg.lora.full_name
+
+			engine.save_checkpoint(save_dir, tag=tag)
+
+			"""
 			try:
 				engine.save_checkpoint(save_dir, tag=tag)
 			except Exception as e:
-				print(f'Failed to save checkpoint for engine {name}:', str(e))
+				_logger.warning(f'Failed to save checkpoint for engine {name}: {str(e)}')
+			"""
 
 			# might be better to prune before saving for safety, but [:0] returns an empty list, but I could do [:-cfg.trainer.keep_last_checkpoints - 1 if cfg.trainer.keep_last_checkpoints > 1 else None]
 			if cfg.trainer.keep_last_checkpoints > 0 and is_global_leader():
@@ -392,7 +433,7 @@ class Engines(dict[str, Engine]):
 				for d in checkpoints:
 					if not d.is_dir() or not d.exists():									
 						continue
-					print("Removing", d)
+					_logger.info(f"Removing {d}")
 					for p in d.iterdir():
 						p.unlink()
 					d.rmdir()
@@ -419,7 +460,7 @@ class Engines(dict[str, Engine]):
 				engine.tokens_processed = 0
 
 		# update the LR because for some god awful reason it gets overwritten when loading from a checkpoint but only when it's not using a scheduler
-		if cfg.hyperparameters.scheduler_type == "":
+		if cfg.hyperparameters.scheduler == "":
 			self.set_lr(cfg.hyperparameters.learning_rate)
 
 		self._update()
@@ -429,6 +470,12 @@ class Engines(dict[str, Engine]):
 			if not engine._training:
 				continue
 			engine.set_lr(lr)
+
+	def set_loss_scale(self, lr):
+		for engine in self.values():
+			if not engine._training:
+				continue
+			engine.set_loss_scale(lr)
 
 	def _update(self):
 		for engine in self.values():
@@ -452,6 +499,13 @@ class Engines(dict[str, Engine]):
 			stats.update(flatten_dict({ name.split("-")[0]: stat }))
 		return stats
 
+	def quit(self):
+		for name, engine in self.items():
+			if engine.wandb is not None:
+				engine.wandb.finish()
+		
+		cleanup_distributed()
+
 	def step(self, batch, feeder: TrainFeeder = default_feeder):
 		total_elapsed_time = 0
 
@@ -460,8 +514,17 @@ class Engines(dict[str, Engine]):
 		if cfg.trainer.gc_mode == 'step':
 			do_gc()
 
+		# preiterate to get teacher
+		teacher = None
 		for name, engine in self.items():
-			if not engine._training:
+			if not engine._teacher:
+				continue
+			teacher = engine.module
+			break
+
+		for name, engine in self.items():
+			# only models that we're training
+			if not engine._training or engine._teacher:
 				continue
 
 			device = engine.device
@@ -471,76 +534,68 @@ class Engines(dict[str, Engine]):
 
 			start_time = time.time()
 
-			tries = 4
-			n_ooms = torch.zeros([], device=device)			
-			
 			batch = to_device(batch, device)
 
 			if not cfg.trainer.check_for_oom:
-				res = feeder( engine=engine, batch=batch )
+				res = feeder( engine=engine, batch=batch, teacher=teacher )
 			else:
-				while tries >= 0:
-					try:
-						res = feeder( engine=engine, batch=batch )
-						break
-					except RuntimeError as e:
-						print("Forward", str(e))
+				forward_ooms = torch.zeros([], device=device)
+				try:
+					res = feeder( engine=engine, batch=batch, teacher=teacher )
+				except RuntimeError as e:
+					_logger.error(f"Forward: {str(e)}")
 
-						if "out of memory" not in str(e):
-							self.save_checkpoint()
-							raise e
+					if "out of memory" not in str(e):
+						self.save_checkpoint()
+						raise e
 
-						# shrink batch size until it's happy
-						for k in batch:
-							batch[k] = batch[k][:-1]
-
-						if tries <= 0:
-							# trigger OOM
-							n_ooms += 1
-						else:
-							# also do GC
-							do_gc()
-						continue
+					forward_ooms += 1
 
 				if world_size() > 1:
-					all_reduce(n_ooms)
-				if n_ooms.item() > 0:
+					all_reduce(forward_ooms)
+
+				if forward_ooms.item() > 0:
+					continue
+					"""
 					self.save_checkpoint()
 					raise RuntimeError("Out of memory during forward pass!")
+					"""
 
+			# this causes problems in distributed training
+			# it's probably required to do all_reduce for nan checks
+			"""
+			# no results are returned when a nan is encountered, so catch it here too
 			if res is None:
+				engine.max_nan_losses = engine.max_nan_losses - 1
+				if engine.max_nan_losses < 0:
+					raise RuntimeError("Too many NaN losses detected.")
 				continue
+			"""
 			
 			loss, engine_stats = res
 			engine_stats |= self.gather_attribute("scalar")
 
-			n_ooms = torch.zeros([], device=device)
-			
-			if cfg.trainer.aggressive_optimizations:
-				batch = to_device(batch, 'cpu')
-
 			if not cfg.trainer.check_for_oom:
 				engine.backward(loss)
 			else:
-				# to-do: properly handle when one GPU throws an OOM because it just halts
+				backward_ooms = torch.zeros([], device=device)
 				try:
 					engine.backward(loss)
 				except RuntimeError as e:
-					print("Backwards:", str(e))
+					_logger.error(f"Backwards: {str(e)}")
 
 					if "out of memory" not in str(e):
 						self.save_checkpoint()
 						raise e
 					
-					n_ooms += 1
+					backward_ooms += 1
 
 				if world_size() > 1:
-					all_reduce(n_ooms)
+					all_reduce(backward_ooms)
 
-				if n_ooms.item() > 0:
+				if backward_ooms.item() > 0:
 					self.save_checkpoint()
-				
-				raise RuntimeError("Out of memory during backwards pass!")
+					raise RuntimeError("Out of memory during backwards pass!")
 
 			engine.step()
 			
@@ -549,29 +604,57 @@ class Engines(dict[str, Engine]):
 			elapsed_time = time.time() - start_time
 			total_elapsed_time += elapsed_time
 			grad_norm = engine.get_global_grad_norm()
-			loss_scale = 1
-			if hasattr(engine.optimizer, "loss_scale") and engine.optimizer.loss_scale is not None:
-				loss_scale = engine.optimizer.loss_scale
-			
-			if grad_norm is not None:
+			loss_scale = engine.get_loss_scale()
+
+			if cfg.trainer.deepspeed.max_loss_scale > 0 and loss_scale > cfg.trainer.deepspeed.max_loss_scale:
+				_logger.warning(f'Loss scale ({loss_scale}) exceeds max_loss_scale ({cfg.trainer.deepspeed.max_loss_scale}), capping...')
+				engine.set_loss_scale(cfg.trainer.deepspeed.max_loss_scale)
+
+			# scale the grad norm to normal, if not using ZeRO because ZeRO does this already
+			if grad_norm is not None and not cfg.trainer.deepspeed.zero_optimization_level:
 				grad_norm /= loss_scale
 
-			stats.update(
-				flatten_dict(
-					{
-						name.split("-")[0]: dict(
-							**engine_stats,
-							lr=engine.get_lr()[0],
-							grad_norm=grad_norm,
-							loss_scale=loss_scale if loss_scale != 1 else None,
-							elapsed_time=elapsed_time,
-							engine_step=engine.global_step,
-							samples_processed=engine.global_samples,
-							tokens_processed=engine.tokens_processed,
-						)
-					}
-				),
+			model_stats = dict(
+				**engine_stats,
+				grad_norm=grad_norm.item() if isinstance( grad_norm, torch.Tensor ) else grad_norm,
+				loss_scale=loss_scale if loss_scale != 1 else None,
 			)
+		
+			if engine.wandb is not None:
+				engine.wandb.log(model_stats, step=engine.global_step)
+
+			filtered_keys = [ k for k in model_stats.keys() if "[" in k ]
+			filtered_values = {}
+			for k in filtered_keys:
+				v = model_stats[k]
+				del model_stats[k]
+
+				nk = re.sub(r"\[\d+\]", "", k)
+				
+				if nk not in filtered_values:
+					filtered_values[nk] = []
+				
+				filtered_values[nk].append( v )
+
+			for k, v in filtered_values.items():
+				model_stats[k] = sum(v) / len(v)
+
+			model_stats = model_stats | dict(
+				lr=engine.get_lr()[0],
+				elapsed_time=elapsed_time,
+				engine_step=engine.global_step,
+				samples_processed=engine.global_samples,
+				tokens_processed=engine.tokens_processed,
+			)
+
+			key_name = name
+			if cfg.lora is not None:			
+				key_name = cfg.lora.full_name
+
+			if len(self) == 1:
+				stats.update(flatten_dict(model_stats))
+			else:
+				stats.update(flatten_dict({key_name.split("-")[0]: model_stats}))
 
 		self._update()
 

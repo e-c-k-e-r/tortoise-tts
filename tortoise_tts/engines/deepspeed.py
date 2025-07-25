@@ -25,7 +25,7 @@ from deepspeed import DeepSpeedEngine, DeepSpeedConfig, comm as dist, init_distr
 from deepspeed.accelerator import get_accelerator
 
 from ..utils.distributed import init_distributed, distributed_initialized
-from ..utils import wrapper as ml
+from ..utils import ml
 
 from ..models.lora import freeze_non_lora_weights
 
@@ -34,10 +34,7 @@ if not distributed_initialized() and cfg.trainer.backend == "deepspeed":
 
 class Engine(DeepSpeedEngine):
 	def __init__(self, *args, **kwargs):
-		self.hyper_config = None
-		if 'hyper_config' in kwargs:
-			self.hyper_config = kwargs['hyper_config']
-			kwargs.pop("hyper_config")
+		self.hyper_config = kwargs.pop('hyper_config', None)
 
 		kwargs['config'] = cfg.trainer.deepspeed.ds_cfg
 		kwargs['config_class'] = DeepSpeedConfig(kwargs['config'])
@@ -55,14 +52,13 @@ class Engine(DeepSpeedEngine):
 			stats = maybe_stats
 
 		super().__init__(None, *args, **kwargs)
-		self._frozen_params = set()
 
 		self.global_steps = stats["global_step"]
 		self.micro_steps = stats["micro_step"]
 		self.global_samples = stats["global_samples"]
 		self.tokens_processed = stats["tokens_processed"]
 
-		self.max_nan_losses = 8
+		self._frozen_params = set()
 		self.current_batch_size = 0
 
 	def freeze(self, freeze_all=True):
@@ -92,6 +88,10 @@ class Engine(DeepSpeedEngine):
 		return self.hyper_config.training
 
 	@property
+	def _teacher(self):
+		return self.hyper_config.teacher
+
+	@property
 	def global_step(self):
 		return self.global_steps
 
@@ -117,7 +117,20 @@ class Engine(DeepSpeedEngine):
 			else:
 				self.optimizer.set_lr(lr)
 		except Exception as e:
-			print(str(e))
+			_logger.warning(str(e))
+
+	# cur_scale, because _get_loss_scale has a typo in the def and I can't be assed to inject a fix into it or push a PR
+	def get_loss_scale(self):
+		if not hasattr(self.optimizer, "cur_scale") or self.optimizer.cur_scale is None:
+			return 1.0
+
+		return self.optimizer.cur_scale
+
+	def set_loss_scale(self, value):
+		if not hasattr(self.optimizer, "cur_scale") or self.optimizer.cur_scale is None:
+			return
+		
+		self.optimizer.cur_scale = value
 
 	# we'll just have to live with the LoRA weights living within our main weights
 	# they're easy to extract anyways
@@ -142,14 +155,18 @@ class Engine(DeepSpeedEngine):
 		losses = self.gather_attribute("loss")
 		loss = torch.stack([*losses.values()]).sum()
 
+		stats = {}
+		stats |= {k: v.item() for k, v in losses.items()}
+		stats |= self.gather_attribute("scalar")
+
+		"""
 		if torch.isnan(loss).any():
 			self.max_nan_losses = self.max_nan_losses - 1
 			if self.max_nan_losses < 0:
 				raise RuntimeError("Too many NaN losses detected.")
-
-		stats = {}
-		stats |= {k: v.item() for k, v in losses.items()}
-		stats |= self.gather_attribute("scalar")
+			
+			return stats
+		"""
 
 		self.backward(loss)
 		self.step()

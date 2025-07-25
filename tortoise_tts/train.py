@@ -1,10 +1,10 @@
 # todo: clean this mess up
 
 from .config import cfg
-from .data import create_train_val_dataloader
+from .data import create_train_val_dataloader, get_random_prompt, tokenize
 from .emb import mel
 
-from .utils import setup_logging, to_device, trainer, flatten_dict, do_gc, wrapper as ml
+from .utils import setup_logging, to_device, trainer, flatten_dict, do_gc, ml
 from .utils.distributed import is_global_leader
 
 import auraloss
@@ -32,7 +32,7 @@ _logger = logging.getLogger(__name__)
 
 mel_stft_loss = auraloss.freq.MelSTFTLoss(cfg.sample_rate, device="cpu")
 
-def train_feeder(engine, batch):
+def train_feeder(engine, batch, teacher=None):
 	with torch.autocast("cuda", dtype=cfg.trainer.dtype, enabled=cfg.trainer.amp):
 		device = batch["text"][0].device
 		batch_size = len(batch["text"])
@@ -63,9 +63,12 @@ def train_feeder(engine, batch):
 	return loss, stats
 
 @torch.inference_mode()
-def run_eval(engines, eval_name, dl):
+def run_eval(engines, eval_name, dl, args=None):
 	stats = defaultdict(list)
 	stats['loss'] = []
+
+	if cfg.evaluation.size == 0:
+		return
 
 	autoregressive = None
 	diffusion = None
@@ -208,10 +211,23 @@ def run_eval(engines, eval_name, dl):
 			ref_audio = ref_audio[..., 0:min_length]
 			hyp_audio = hyp_audio[..., 0:min_length]
 			stats['loss'].append(mel_stft_loss(hyp_audio[None, :, :], ref_audio[None, :, :]).item())
-
+	
 	processed = 0
 	while processed < cfg.evaluation.size:
-		batch = to_device(next(iter(dl)), cfg.device)
+		# directly randomly sample
+		if eval_name == "subtrain":
+			# sample from dataset
+			# to-do: derive from current iteration
+			samples = [ to_device(dl.dataset[random.randint( 0, len( dl.dataset ) )], cfg.device) for sample in range( cfg.evaluation.batch_size ) ]
+			# collate manually
+			batch = {k: [s[k] for s in samples] for k in samples[0]}
+		else:
+			batch = to_device(next(iter(dl)), cfg.device)
+
+		# limit to eval batch size in the event we somehow have a weird dataloader
+		for key in batch.keys():
+			batch[key] = batch[key][:cfg.evaluation.batch_size]
+
 		batch_size = len(batch["text"])
 		processed += batch_size
 
@@ -220,26 +236,31 @@ def run_eval(engines, eval_name, dl):
 
 		process( name, batch, hyp, ref )
 
-	stats = {k: sum(v) / len(v) for k, v in stats.items()}
+	stats = {k: sum(v) / len(v) for k, v in stats.items() if v}
 	engines_stats = {
-		f'{name}.{eval_name}': stats,
+		eval_name: stats,
 		"it": engines.global_step,
 	}
+
+	try:
+		for name, engine in engines.items():
+			if engine.wandb is not None:
+				engine.wandb.log({
+					f'{eval_name}.loss.mstft': stats['loss'],
+				}, step=engine.global_step)
+	except Exception as e:
+		print(e)
+
 	#engines_stats['epoch'] = iteration * cfg.hyperparameters.gradient_accumulation_steps / len(dl)
 
-	if cfg.trainer.no_logger:
-		tqdm.write(f"Validation Metrics: {json.dumps(engines_stats)}.")
-	else:
-		_logger.info(f"Validation Metrics: {json.dumps(engines_stats)}.")
-
-	diffusion = diffusion.to("cpu")
-	clvp = clvp.to("cpu")
-	vocoder = vocoder.to("cpu")
+	_logger.info(f"Validation Metrics: {json.dumps(engines_stats)}.")
 
 
 def train():
 	parser = argparse.ArgumentParser("TorToiSe TTS")
 	parser.add_argument("--eval", action="store_true", default=None)
+	parser.add_argument("--eval-random-text-prompts", action="store_true", default=None)
+	#parser.add_argument("--eval-random-audio-prompts", action="store_true", default=None)
 	args, unknown = parser.parse_known_args()
 
 	# create log folder
@@ -247,35 +268,37 @@ def train():
 	# copy config yaml to backup
 	if cfg.yaml_path is not None and is_global_leader():
 		shutil.copy( cfg.yaml_path, cfg.log_dir / "config.yaml" )
-
-	train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
-	
+	# create dataloaders
+	train_dl, val_dl = create_train_val_dataloader()
+	# evaluation lambda
 	def eval_fn(engines):
 		do_gc()
 		engines.eval()
 		# wrapped in a try block because it's sometimes prone to breaking
 		try:
-			run_eval(engines, "subtrain", subtrain_dl)
-			run_eval(engines, "val", val_dl)
+			run_eval(engines, "subtrain", train_dl, args)
+			run_eval(engines, "val", val_dl, args)
 		except Exception as e:
-			print("Error occurred while performing eval:", str(e))
-			print(traceback.format_exc())
+			_logger.warning(f"Error occurred while performing eval: {str(e)}")
+			_logger.warning(traceback.format_exc())
 
 		engines.train()
-		#qnt.unload_model()
+		#mel.unload_model()
 		do_gc()
-
-	#qnt.unload_model()
-	
+	# unload EnCodec if it's already loaded
+	#mel.unload_model()
+	# only eval is requested
 	if args.eval:
 		return eval_fn(engines=trainer.load_engines())
 
 	"""
+	# start web UI
 	if cfg.trainer.load_webui:
 		from .webui import start
 		start(lock=False)
 	"""
 
+	# train
 	trainer.train(
 		train_dl=train_dl,
 		train_feeder=train_feeder,
