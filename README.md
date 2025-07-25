@@ -22,6 +22,8 @@ Using the default settings: `python3 -m tortoise_tts --yaml="./data/config.yaml"
 To inference using the included Web UI: `python3 -m tortoise_tts.webui --yaml="./data/config.yaml"`
 + Pass `--listen 0.0.0.0:7860` if you're accessing the web UI from outside of `localhost` (or pass the host machine's local IP instead)
 
+A LoRA can be loaded by appending `--lora=./path/to/your/lora.sft` for either above commands.
+
 ### Training / Finetuning
 
 Training is as simple as copying the reference YAML from `./data/config.yaml` to any training directory of your choice (for examples: `./training/` or `./training/lora-finetune/`).

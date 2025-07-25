@@ -109,10 +109,18 @@ class BaseConfig:
 		return yaml
 
 	@classmethod
-	def from_yaml( cls, yaml_path ):
+	def from_yaml( cls, yaml_path, lora_path=None ):
 		state = {}
 		state = yaml.safe_load(open(yaml_path, "r", encoding="utf-8"))
 		state.setdefault("yaml_path", yaml_path)
+
+		if lora_path:
+			if not lora_path.exists():
+				raise Exception(f'LoRA path does not exist: {lora_path}')
+
+			lora_state_dict = torch_load( lora_path ) if lora_path and lora_path.exists() else None
+			state["loras"] = [ lora_state_dict["config"] | { "path": lora_path } ] if lora_state_dict is not None else []
+
 		state = cls.prune_missing( state )
 		return cls(**state)
 
@@ -127,23 +135,11 @@ class BaseConfig:
 		model_state_dict = torch_load( model_path ) if model_path and model_path.exists() else None
 		lora_state_dict = torch_load( lora_path ) if lora_path and lora_path.exists() else None
 
+
 		models_config = [ model_state_dict["config"] | { "path": model_path } | model_kwargs ] if model_state_dict is not None else []
 		loras_config = [ lora_state_dict["config"] | { "path": lora_path } ] if lora_state_dict is not None else []
 
 		state = { "models": models_config, "loras": loras_config, "trainer": { "load_state_dict": True } }
-
-		deduced_backend = None
-		if model_state_dict is not None:
-			# 9 audio levels, will always be DAC
-			if "proms_emb.embs.8.weight" in model_state_dict["module"]:
-				deduced_backend = "dac"
-			# 8 audio levels, may be encodec/vocos (1024 tokens) or nemo (1000 tokens)
-			elif "proms_emb.embs.7.weight" in model_state_dict["module"]:
-				deduced_backend = "nemo" if model_state_dict["module"]["proms_emb.embs.7.weight"].shape[0] == 1000 else "vocos"
-		
-		if deduced_backend:
-			_logger.info(f'Deduced audio backend: {deduced_backend}')
-			state["audio_backend"] = deduced_backend
 
 		return cls(**state)
 
@@ -164,7 +160,7 @@ class BaseConfig:
 			return cls.from_model( args.model, args.lora )
 
 		if args.yaml:
-			return cls.from_yaml( args.yaml )
+			return cls.from_yaml( args.yaml, args.lora )
 
 		return cls(**{})
 
@@ -265,6 +261,7 @@ class Dataset:
 @dataclass()
 class Model:
 	name: str = "" # vanity name for the model
+	attention: str = "eager" # vanity name for the model
 	training: bool = False # I really need to attend to this
 	teacher: bool = False # if this is to be treated as a teacher
 
@@ -746,8 +743,8 @@ class Config(BaseConfig):
 	"""
 
 	# this gets called from vall_e.inference
-	def load_yaml( self, config_path ):
-		tmp = Config.from_yaml( config_path )
+	def load_yaml( self, config_path, lora_path=None ):
+		tmp = Config.from_yaml( config_path, lora_path )
 		self.__dict__.update(tmp.__dict__)
 	
 	def load_model( self, config_path, lora_path=None ):

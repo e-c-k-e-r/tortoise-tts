@@ -44,22 +44,44 @@ class timer:
     def __exit__(self, type, value, traceback):
         print(f'[{datetime.now().isoformat()}] Elapsed time: {(perf_counter() - self.start):.3f}s')
 
-def init_tts(restart=False):
+def init_tts(config=None, lora=None, restart=False, device="cuda", dtype="auto", attention=None):
 	global tts
 
 	if tts is not None:
 		if not restart:
 			return tts
+		
 		del tts
+		tts = None
 	
-	parser = argparse.ArgumentParser(allow_abbrev=False)
-	parser.add_argument("--yaml", type=Path, default=os.environ.get('VALLE_YAML', None)) # os environ so it can be specified in a HuggingFace Space too
-	parser.add_argument("--device", type=str, default="cuda")
+	parser = argparse.ArgumentParser(allow_abbrev=False, add_help=False)
+	parser.add_argument("--yaml", type=Path, default=os.environ.get('TORTOISE_YAML', None)) # os environ so it can be specified in a HuggingFace Space too
+	parser.add_argument("--model", type=Path, default=os.environ.get('TORTOISE_MODEL', None)) # os environ so it can be specified in a HuggingFace Space too
+	parser.add_argument("--lora", type=Path, default=os.environ.get('TORTOISE_LORA', None)) # os environ so it can be specified in a HuggingFace Space too
+	parser.add_argument("--device", type=str, default=device)
 	parser.add_argument("--amp", action="store_true")
-	parser.add_argument("--dtype", type=str, default="auto")
+	parser.add_argument("--dtype", type=str, default=dtype)
+	parser.add_argument("--attention", type=str, default=attention)
 	args, unknown = parser.parse_known_args()
 
-	tts = TTS( config=args.yaml, device=args.device, dtype=args.dtype if args.dtype != "auto" else None, amp=args.amp )
+	if config:
+		if config.suffix == ".yaml" and not args.yaml:
+			args.yaml = config
+		elif config.suffix == ".sft" and not args.model:
+			args.model = config
+
+	if lora and not args.lora:
+		args.lora = lora
+
+	if args.yaml:
+		config = args.yaml
+	elif args.model:
+		config = args.model
+
+	if args.lora:
+		lora = args.lora
+
+	tts = TTS( config=config, lora=args.lora, device=args.device, dtype=args.dtype if args.dtype != "auto" else None, amp=args.amp, attention=args.attention )
 	return tts
 
 @gradio_wrapper(inputs=layout["inference"]["inputs"].keys())

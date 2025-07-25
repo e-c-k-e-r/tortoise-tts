@@ -163,6 +163,7 @@ def load_model(name, device="cuda", **kwargs):
 		state_dict = torch.load(load_path, map_location=device)
 		if state_dict_key:
 			state_dict = state_dict[state_dict_key]
+		
 		model.load_state_dict(state_dict, strict=strict)
 
 	model.eval()

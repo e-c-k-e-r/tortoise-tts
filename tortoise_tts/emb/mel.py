@@ -85,7 +85,7 @@ def encode(wav: Tensor, sr: int = cfg.sample_rate, device="cuda", dtype=None):
 	wav = torchaudio.functional.resample(wav, sr, 22050)
 
 	dvae = load_model("dvae", device=device)
-	unified_voice = load_model("unified_voice", device=device)
+	unified_voice = load_model("autoregressive", device=device)
 	diffusion = load_model("diffusion", device=device)
 	mel_inputs = format_autoregressive_conditioning( wav, 0, device )
 

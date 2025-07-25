@@ -2,11 +2,14 @@ import torch
 import torchaudio
 import soundfile
 import time
+import logging
 
 from torch import Tensor
 from einops import rearrange
 from pathlib import Path
 from tqdm import tqdm
+
+_logger = logging.getLogger(__name__)
 
 from .emb.mel import encode_from_files as encode_mel, trim, trim_random
 from .utils import to_device, set_seed, ml
@@ -15,6 +18,9 @@ from .config import cfg, DEFAULT_YAML
 from .models import get_models, load_model
 from .engines import load_engines, deepspeed_available
 from .data import get_phone_symmap, tokenize
+
+from .utils.io import torch_save, torch_load, pick_path
+from .models.lora import apply_lora, lora_load_state_dict
 
 from .models.arch_utils import denormalize_tacotron_mel
 from .models.diffusion import get_diffuser
@@ -26,24 +32,35 @@ if deepspeed_available:
 	import deepspeed
 
 class TTS():
-	def __init__( self, config=None, device=None, amp=None, dtype=None ):
+	def __init__( self, config=None, lora=None, device=None, amp=None, dtype=None, attention=None ):
 		self.loading = True 
-		
-		self.input_sample_rate = 24000
-		self.output_sample_rate = 24000
 
-		if config is None:
+		# yes I can just grab **kwargs and forward them here
+		self.load_config( config=config, lora=lora, device=device, amp=amp, dtype=dtype, attention=attention )	
+		self.load_model()
+
+		self.loading = False 
+
+	def load_config( self, config=None, lora=None, device=None, amp=None, dtype=None, attention=None ):
+		if not config:
 			config = DEFAULT_YAML
 
-		if config:
-			cfg.load_yaml( config )
+		if config.suffix == ".yaml":
+			_logger.info(f"Loading YAML: {config}")
+			cfg.load_yaml( config, lora )
+		elif config.suffix == ".sft":
+			_logger.info(f"Loading model: {config}")
+			cfg.load_model( config, lora )
+		else:
+			raise Exception(f"Unknown config passed: {config}")		
 
-		try:
-			cfg.format( training=False )
-			cfg.dataset.use_hdf5 = False # could use cfg.load_hdf5(), but why would it ever need to be loaded for inferencing
-		except Exception as e:
-			print("Error while parsing config YAML:")
-			raise e # throw an error because I'm tired of silent errors messing things up for me
+		cfg.format( training=False )
+		cfg.dataset.use_hdf5 = False # could use cfg.load_hdf5(), but why would it ever need to be loaded for inferencing
+
+		# fallback to encodec if no vocos
+		if cfg.audio_backend == "vocos" and "vocos" not in AVAILABLE_AUDIO_BACKENDS:
+			_logger.warning("Vocos requested but not available, falling back to Encodec...")
+			cfg.set_audio_backend(cfg.audio_backend)
 
 		if amp is None:
 			amp = cfg.inference.amp
@@ -61,20 +78,30 @@ class TTS():
 		self.device = device
 		self.dtype = cfg.inference.dtype
 		self.amp = amp
+		self.batch_size = cfg.inference.batch_size
+		
+		self.model_kwargs = {}
+		if attention:
+			self.model_kwargs["attention"] = attention
 
-		self.symmap = None
-
-		self.engines = load_engines(training=False)
+	def load_model( self ):
+		load_engines.cache_clear()
+		
+		self.engines = load_engines(training=False, **self.model_kwargs)
 		for name, engine in self.engines.items():
 			if self.dtype != torch.int8:
 				engine.to(self.device, dtype=self.dtype if not self.amp else torch.float32)
 
 		self.engines.eval()
+		self.symmap = get_phone_symmap()
+		_logger.info("Loaded model")
 
-		if self.symmap is None:
-			self.symmap = get_phone_symmap()
+	def enable_lora( self, enabled=True ):
+		for name, engine in self.engines.items():
+			enable_lora( engine.module, mode = enabled )
 
-		self.loading = False 
+	def disable_lora( self ):
+		return self.enable_lora( enabled=False )
 
 	def encode_text( self, text, language="en" ):
 		# already a tensor, return it
@@ -173,6 +200,20 @@ class TTS():
 			clvp = load_model("clvp", device=cfg.device)
 		if vocoder is None:
 			vocoder = load_model(vocoder_type, device=cfg.device)
+
+		# load lora weights if exists
+		if cfg.lora is not None and hasattr( autoregressive, "gpt" ):
+			if cfg.lora.path:
+				lora_path = cfg.lora.path
+			else:
+				lora_path = pick_path( cfg.ckpt_dir / cfg.lora.full_name / f"lora.{cfg.weights_format}", *[ f'.{format}' for format in cfg.supported_weights_formats] )
+
+			if lora_path.exists():
+				_logger.info( f"Loaded LoRA state dict: {lora_path}" )
+
+				state = torch_load(lora_path, device=cfg.device)
+				state = state['lora' if 'lora' in state else 'module']
+				lora_load_state_dict( autoregressive, state )
 		
 		autoregressive = autoregressive.to(cfg.device)
 		diffusion = diffusion.to(cfg.device)

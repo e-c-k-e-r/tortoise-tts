@@ -249,7 +249,7 @@ def load_engines(training=True, **model_kwargs):
 			model.load_state_dict(state, strict=cfg.trainer.strict_loading)
 
 			# load lora weights if exists
-			if cfg.lora is not None:
+			if cfg.lora is not None and hasattr( model, "gpt" ):
 				if cfg.lora.path:
 					lora_path = cfg.lora.path
 				else:
