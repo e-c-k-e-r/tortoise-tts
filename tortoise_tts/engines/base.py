@@ -376,7 +376,6 @@ class Engines(dict[str, Engine]):
 				save_path = cfg.ckpt_dir / cfg.lora.full_name / f"{cfg.weights_name}.{format}"
 
 			config_dict = dict(**config.__dict__)
-			config_dict |= {"experimental": config.experimental.__dict__}
 
 			state_dict = {
 				'module': module,

@@ -298,15 +298,17 @@ class Model:
 
 	@property
 	def lora_policy(self):
-		include = ["model"] # by default only adapt the main model (not embeddings nor classifier/output projection/LM head/whatever)
+		include = ["gpt"] # by default only adapt the main model (not embeddings nor classifier/output projection/LM head/whatever)
 		exclude = []
 
+		"""
 		if self.arch_type == "llama":
 			include = ["self_attn", "mlp"] # target only the attention + mlp
 			exclude = ["self_attn.k_proj"] # common literature says to ignore it
 		if self.arch_type == "retnet":
 			include = ["layers."] # target the core layers of the RetNet and ignore the auxiliary stuff
 			exclude = ["retention.k_proj"] # attention-based transformers ignore the K, so might as well ignore it for the retnet
+		"""
 
 		return dict(include=include, exclude=exclude)
 
@@ -324,7 +326,7 @@ class LoRA:
 	alpha: int = 128 # rank for the LoRA
 	training: bool = True # 
 	embeddings: bool = False # train the embedding too
-	parametrize: bool = False # whether to use the parameterized pathway for LoRAs or not
+	parametrize: bool = True # whether to use the parameterized pathway for LoRAs or not
 	path: Path | None = None
 
 	@property
